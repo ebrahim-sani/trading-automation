@@ -1,0 +1,46 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./signals.db"
+}
+
+model Signal {
+  id         String   @id @default(cuid())
+  ticker     String
+  action     String
+  entry      Float
+  sl         Float
+  tp         Float
+  rr         Float
+  bias1h     String
+  bias4h     String
+  aligned    Boolean
+  receivedAt DateTime @default(now())
+  trade      Trade?
+}
+
+model Trade {
+  id           String    @id @default(cuid())
+  signalId     String?   @unique
+  signal       Signal?   @relation(fields: [signalId], references: [id])
+  ticker       String
+  action       String
+  entry        Float
+  sl           Float
+  tp           Float
+  lots         Float
+  riskUsd      Float     @default(5.0)
+  mt5Ticket    BigInt?
+  status       String    @default("PENDING")
+  openedAt     DateTime?
+  closedAt     DateTime?
+  closeReason  String?
+  breakevenSet Boolean   @default(false)
+  pnl          Float?
+  errorMsg     String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
