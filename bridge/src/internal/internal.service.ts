@@ -37,7 +37,7 @@ export class InternalService {
         tp:        data.tp,
         lots:      data.lots,
         riskUsd:   data.riskUsd,
-        mt5Ticket: data.mt5Ticket,
+        mt5Ticket: data.mt5Ticket ? BigInt(data.mt5Ticket) : null,
         status:    'OPEN',
         openedAt:  new Date(),
       },
@@ -68,7 +68,7 @@ export class InternalService {
 
   async closeTrade(data: any) {
     await this.prisma.trade.updateMany({
-      where: { mt5Ticket: data.mt5Ticket },
+      where: { mt5Ticket: BigInt(data.mt5Ticket) },
       data: {
         status:      'CLOSED',
         closedAt:    new Date(),
@@ -82,9 +82,9 @@ export class InternalService {
     return { ok: true };
   }
 
-  async setBreakeven(ticket: number) {
+  async setBreakeven(ticket: bigint | number | string) {
     await this.prisma.trade.updateMany({
-      where: { mt5Ticket: ticket },
+      where: { mt5Ticket: BigInt(ticket) },
       data:  { breakevenSet: true },
     });
     this.logger.log(`Breakeven confirmed | #${ticket}`);

@@ -112,11 +112,13 @@ class MT5Executor:
                 continue
 
             # ── Breakeven ─────────────────────────────────────────────
-            if trade.get("breakeven_set"):
+            if trade.get("breakevenSet"):
                 continue
 
+            # Position missing means it hit SL or TP natively in MT5!
             positions = mt5.positions_get(ticket=ticket)
             if not positions:
+                self._sync_closed_position(ticket, journal)
                 continue
 
             pos    = positions[0]
@@ -171,6 +173,29 @@ class MT5Executor:
             journal.close_trade(ticket, reason, pnl)
         else:
             log.error(f"Close failed #{ticket}: {result.comment if result else mt5.last_error()}")
+
+    def _sync_closed_position(self, ticket: int, journal):
+        """
+        Catches positions that disappeared (hit SL or TP natively in MT5)
+        and synchronizes their closed state and final PnL back to the database.
+        """
+        # A position forms one or more 'deals' spanning its lifetime
+        now = datetime.now()
+        # Fetching a large time range for history to guarantee we capture it
+        from_ts = datetime(2020, 1, 1)
+        deals = mt5.history_deals_get(from_ts, now, position=ticket)
+        
+        if not deals:
+            log.warning(f"Could not find history for closed position #{ticket}")
+            return
+            
+        pnl = sum(d.profit + d.swap + d.commission for d in deals)
+        
+        last_deal = deals[-1]
+        reason = last_deal.comment if last_deal.comment else "SL/TP Hit"
+        
+        log.info(f"Position #{ticket} closed natively | Reason: {reason} | PnL: ${pnl:.2f}")
+        journal.close_trade(ticket, reason, pnl)
 
     def _get_filling(self, symbol: str) -> int:
         info = mt5.symbol_info(symbol)

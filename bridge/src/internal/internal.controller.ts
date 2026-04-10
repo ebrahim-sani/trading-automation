@@ -29,7 +29,7 @@ export class InternalController {
 
   @Post('trade/:ticket/breakeven')
   setBreakeven(@Param('ticket') ticket: string) {
-    return this.svc.setBreakeven(parseInt(ticket));
+    return this.svc.setBreakeven(BigInt(ticket));
   }
 
   @Get('today-pnl')
