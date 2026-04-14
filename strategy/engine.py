@@ -63,8 +63,8 @@ class StrategyEngine:
         trade_timeout_minutes: int   = 60,
         max_open_trades:       int   = 3,
         max_pivot_bars:        int   = 120,
-        session_start_hour:    int   = 8,      # 08:00 UTC (London Open target)
-        session_end_hour:      int   = 17,     # 17:00 UTC (London Close)
+        session_start_hour:    float = 7.5,    # 07:30 Broker Time target
+        session_end_hour:      float = 19.0,   # 19:00 Broker Time
         max_daily_loss_usd:    float = None,
         max_weekly_loss_usd:   float = None,
         max_consecutive_loss:  int   = 2,      # Cooldown after N losses
@@ -119,7 +119,9 @@ class StrategyEngine:
         if not self.executor.init():
             return
 
-        log.info(f"Targeting Session: {self.session_start:02d}:00 – {self.session_end:02d}:00 UTC")
+        start_h, start_m = int(self.session_start), int((self.session_start % 1) * 60)
+        end_h, end_m = int(self.session_end), int((self.session_end % 1) * 60)
+        log.info(f"Targeting Session: {start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} Broker Time")
         
         for symbol in self.symbols:
             if not mt5.symbol_select(symbol, True):
@@ -462,7 +464,8 @@ class StrategyEngine:
 
     def _is_in_session(self, bar_time: int) -> bool:
         dt = datetime.fromtimestamp(bar_time, tz=timezone.utc)
-        return self.session_start <= dt.hour < self.session_end
+        decimal_time = dt.hour + (dt.minute / 60.0)
+        return self.session_start <= decimal_time < self.session_end
 
     def _check_consecutive_losses(self) -> bool:
         """
