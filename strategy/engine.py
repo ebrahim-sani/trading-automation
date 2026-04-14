@@ -229,9 +229,16 @@ class StrategyEngine:
         if new_high is not None:
             self.top_liq[symbol] = new_high
             self.top_liq_idx[symbol] = current_idx - (len(highs[:-1]) - 1 - nh_idx)
+        else:
+            self.top_liq.pop(symbol, None)
+            self.top_liq_idx.pop(symbol, None)
+
         if new_low is not None:
             self.bot_liq[symbol] = new_low
             self.bot_liq_idx[symbol] = current_idx - (len(lows[:-1]) - 1 - nl_idx)
+        else:
+            self.bot_liq.pop(symbol, None)
+            self.bot_liq_idx.pop(symbol, None)
 
         top_liq = self.top_liq.get(symbol)
         bot_liq = self.bot_liq.get(symbol)
@@ -593,8 +600,10 @@ class StrategyEngine:
     def _is_spike_market(self, highs: np.ndarray, lows: np.ndarray, atr: float, lookback: int = 10) -> bool:
         if atr <= 0 or len(highs) < lookback:
             return False
-        total_range = float(np.max(highs[-lookback:]) - np.min(lows[-lookback:]))
-        return total_range > atr * 2.5
+        recent_highs = highs[-lookback:]
+        recent_lows = lows[-lookback:]
+        max_candle_range = float(np.max(recent_highs - recent_lows))
+        return max_candle_range > atr * 2.5
 
     def _get_htf_bias(self, symbol: str, timeframe) -> tuple:
         bars = mt5.copy_rates_from_pos(symbol, timeframe, 0, 201)

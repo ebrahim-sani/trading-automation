@@ -9,7 +9,7 @@ echo.
 start "TTFM Bridge (NestJS / MongoDB)" cmd /k "cd /d %~dp0bridge && npm run start:dev"
 
 :: 2. Start Vibe-Trading Research Brain (AI Swarm)
-start "Vibe-Trading Research (AI Swarm)" cmd /k "cd /d %~dp0vibe-trading && vibe-trading serve --port 8899"
+start "Vibe-Trading Research (AI Swarm)" cmd /k "cd /d %~dp0vibe-trading && py -m cli serve --port 8899"
 
 :: Wait for services to boot
 timeout /t 10 /nobreak > nul
