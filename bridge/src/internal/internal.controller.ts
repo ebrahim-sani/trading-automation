@@ -29,16 +29,26 @@ export class InternalController {
 
   @Post('trade/:ticket/breakeven')
   setBreakeven(@Param('ticket') ticket: string) {
-    return this.svc.setBreakeven(BigInt(ticket));
+    return this.svc.setBreakeven(ticket);
   }
 
-  @Get('today-pnl')
-  async getTodayPnl() {
-    return this.svc.getTodayPnl();
+  @Post('trade/:ticket/partial-close')
+  setPartialClosed(@Param('ticket') ticket: string) {
+    return this.svc.setPartialClosed(ticket);
   }
 
   @Get('trade/open')
   getOpenTrades() {
     return this.svc.getOpenTrades();
+  }
+
+  @Get('today-pnl')
+  getTodayPnl() {
+    return this.svc.getTodayPnl();
+  }
+
+  @Get('week-pnl')
+  getWeekPnl() {
+    return this.svc.getWeekPnl();
   }
 }

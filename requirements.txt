@@ -1,0 +1,26 @@
+# TTFM Institutional Trading Swarm - AWS Deployment Requirements
+
+# Core Trading
+MetaTrader5>=5.0.45
+numpy>=1.24.0
+pandas>=2.0.0
+
+# AI & Machine Learning
+torch>=2.0.0
+google-generativeai>=0.3.0
+google-genai>=0.1.0
+smart-money-concepts>=0.0.5
+
+# Networking & Communication
+python-socketio[client]>=5.10.0
+requests>=2.31.0
+httpx>=0.25.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+
+# Utilities
+python-dotenv>=1.0.0
+rich>=13.7.0
+pydantic>=2.5.0
+pydantic-core>=2.14.0
+dataclasses; python_version < '3.7'

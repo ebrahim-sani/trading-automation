@@ -1,14 +1,17 @@
+// Prisma schema — MongoDB
+// Run: npx prisma generate  (no migrate needed for MongoDB)
+
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "sqlite"
-  url      = "file:./signals.db"
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
 }
 
 model Signal {
-  id         String   @id @default(cuid())
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
   ticker     String
   action     String
   entry      Float
@@ -18,29 +21,35 @@ model Signal {
   bias1h     String
   bias4h     String
   aligned    Boolean
+  score      Int?               // v7: 0-100 scoring engine value
+  factors    Json?              // v7: breakdown {trend,sweep,disp,atr,vol}
   receivedAt DateTime @default(now())
   trade      Trade?
 }
 
 model Trade {
-  id           String    @id @default(cuid())
-  signalId     String?   @unique
-  signal       Signal?   @relation(fields: [signalId], references: [id])
-  ticker       String
-  action       String
-  entry        Float
-  sl           Float
-  tp           Float
-  lots         Float
-  riskUsd      Float     @default(5.0)
-  mt5Ticket    BigInt?
-  status       String    @default("PENDING")
-  openedAt     DateTime?
-  closedAt     DateTime?
-  closeReason  String?
-  breakevenSet Boolean   @default(false)
-  pnl          Float?
-  errorMsg     String?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  id             String    @id @default(auto()) @map("_id") @db.ObjectId
+  signalId       String?   @unique @db.ObjectId
+  signal         Signal?   @relation(fields: [signalId], references: [id])
+  ticker         String
+  action         String
+  entry          Float
+  sl             Float
+  tp             Float
+  lots           Float
+  riskUsd        Float     @default(5.0)
+  mt5Ticket      String?   // MongoDB stores as String (was BigInt in SQLite)
+  status         String    @default("PENDING")
+  openedAt       DateTime?
+  closedAt       DateTime?
+  closeReason    String?
+  breakevenSet   Boolean   @default(false)
+  partialClosed  Boolean   @default(false)   // new: partial exit at +1.5R
+  pnl            Float?
+  errorMsg       String?
+  // v7 metadata
+  scoreAtEntry   Int?      // snapshot of score that triggered execution
+  setupScore     Float?    // composite float score (0-1) for analytics
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 }
