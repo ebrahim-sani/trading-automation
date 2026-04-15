@@ -9,6 +9,28 @@ import numpy as np
 import pandas as pd
 import torch
 import requests
+from dotenv import load_dotenv
+
+env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "vibe-trading", "agent", ".env")
+load_dotenv(env_path)
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def send_telegram_alert(message: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or "YOUR_" in TELEGRAM_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        log = logging.getLogger("Engine")
+        log.error(f"Telegram Error: {e}")
 
 # Add Kronos path to sys.path
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "Kronos"))
@@ -287,6 +309,43 @@ class StrategyEngine:
         # We don't strictly require Kronos (AIE) to be > 0, but it adds +20 points
         valid_long  = bull_score >= self.min_score and sweep_bull > 0
         valid_short = bear_score >= self.min_score and sweep_bear > 0
+
+        # --- TELEGRAM REPORTING ON PRE-FLIGHT ---
+        if sweep_bull > 0:
+            status = "🚀 LONG EXECUTING" if valid_long else f"🚫 LONG SKIPPED (Score < {self.min_score})"
+            msg = (
+                f"🔎 *SWEEP DETECTED* | {symbol}\n"
+                f"Direction: LONG\n"
+                f"Total Score: {bull_score}/{self.min_score}\n"
+                f"Status: {status}\n\n"
+                f"*Points Breakdown:*\n"
+                f"• Trend: {scores['trend_bull']}/20\n"
+                f"• Sweep: {scores['sweep_bull']}/20\n"
+                f"• Displacement: {scores['disp_bull']}/20\n"
+                f"• ATR: {scores['vol_score']}/20\n"
+                f"• Volume: {scores['volm_score']}/20\n"
+                f"• Kronos AI: {scores['aie_bull']}/20\n"
+                f"• Vibe (SMC): {scores['vibe_bull']}/20\n"
+            )
+            send_telegram_alert(msg)
+            
+        if sweep_bear > 0:
+            status = "🚀 SHORT EXECUTING" if valid_short else f"🚫 SHORT SKIPPED (Score < {self.min_score})"
+            msg = (
+                f"🔎 *SWEEP DETECTED* | {symbol}\n"
+                f"Direction: SHORT\n"
+                f"Total Score: {bear_score}/{self.min_score}\n"
+                f"Status: {status}\n\n"
+                f"*Points Breakdown:*\n"
+                f"• Trend: {scores['trend_bear']}/20\n"
+                f"• Sweep: {scores['sweep_bear']}/20\n"
+                f"• Displacement: {scores['disp_bear']}/20\n"
+                f"• ATR: {scores['vol_score']}/20\n"
+                f"• Volume: {scores['volm_score']}/20\n"
+                f"• Kronos AI: {scores['aie_bear']}/20\n"
+                f"• Vibe (SMC): {scores['vibe_bear']}/20\n"
+            )
+            send_telegram_alert(msg)
 
         signals = []
 
