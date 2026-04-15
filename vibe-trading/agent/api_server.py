@@ -623,28 +623,49 @@ async def execute_skill(request: dict):
 
     try:
         if skill_name == "smc":
-            # Dynamically import the SignalEngine from the skill directory
             import sys
             import os
+            # Fix: force UTF-8 before importing smartmoneyconcepts (it prints a star emoji on import
+            # which crashes the AWS Windows worker if the console is not UTF-8 encoded)
+            os.environ["PYTHONIOENCODING"] = "utf-8"
+            if hasattr(sys.stdout, "reconfigure"):
+                try:
+                    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+
             skill_dir = Path(__file__).resolve().parent / "src" / "skills" / "smc"
-            sys.path.append(str(skill_dir))
+            if str(skill_dir) not in sys.path:
+                sys.path.insert(0, str(skill_dir))
             from example_signal_engine import SignalEngine
-            
+
             df = pd.DataFrame(data)
-            # Ensure index is datetime as required by smartmoneyconcepts
+
+            # Build a proper datetime index from the 'time' (Unix seconds) column.
+            # BUG FIX: engine was previously sending data without the 'time' column,
+            # causing pd.to_datetime(df.index) to produce a broken 1970-epoch nanosecond
+            # index which made the SMC library emit all-zero signals.
             if "time" in df.columns:
-                df["time"] = pd.to_datetime(df["time"], unit='s')
+                df["time"] = pd.to_datetime(df["time"], unit="s")
                 df = df.set_index("time")
             else:
-                df.index = pd.to_datetime(df.index)
+                df.index = pd.RangeIndex(len(df))  # safe integer fallback
 
             engine = SignalEngine(swing_length=5, close_break=True)
             signals = engine.generate({symbol: df})
-            
-            # Get the very last signal
-            last_signal = int(signals[symbol].iloc[-1]) if not signals[symbol].empty else 0
+            sig = signals[symbol]
+
+            # BUG FIX: BOS/ChoCH fires on ONE single candle then immediately returns to 0.
+            # Instead of checking iloc[-1] or an artificial lookback, just grab the absolute clearest
+            # and most recent structural bias on the chart.
+            non_zero = sig[sig != 0]
+            if not non_zero.empty:
+                last_signal = int(non_zero.iloc[-1])
+            else:
+                last_signal = 0
+
             return {"skill": skill_name, "symbol": symbol, "signal": last_signal}
-        
+
         # Fallback for other skills
         return {"skill": skill_name, "signal": 0, "note": "Skill not yet optimized for direct execution"}
     except Exception as e:

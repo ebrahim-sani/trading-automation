@@ -554,22 +554,22 @@ class StrategyEngine:
         Returns vibe_bull, vibe_bear (0 or 20)
         """
         try:
-            # We use /runs/direct as a quick way to run a skill without full session state
-            # Note: Port 8899 is our Vibe server
             url = "http://localhost:8899/skills/execute"
             
-            # Prepare data sample (vibe expects OHLC)
+            # Include 'time' column so the server can build a proper datetime index.
+            # BUG FIX: previously 'time' was stripped, causing a broken 1970-epoch index
+            # inside the smartmoneyconcepts library, producing all-zero signals.
             df_tail = pd.DataFrame(bars).tail(100)
-            data_payload = df_tail[['open', 'high', 'low', 'close', 'tick_volume']].to_dict('records')
+            data_payload = df_tail[['time', 'open', 'high', 'low', 'close', 'tick_volume']].to_dict('records')
             
             resp = requests.post(
-                url, 
+                url,
                 json={
                     "skill": "smc",
                     "symbol": symbol,
                     "data": data_payload
                 },
-                timeout=3
+                timeout=5
             )
             
             if resp.status_code == 200:
