@@ -15,7 +15,7 @@ class MT5Executor:
         log.info(f"MT5 OK | Build: {info.build} | Trade allowed: {info.trade_allowed}")
         return True
 
-    def open_trade(self, symbol, action, entry, sl, tp, risk_usd, journal):
+    def open_trade(self, symbol, action, entry, sl, tp, risk_usd, journal, score=None, setup_score=None):
         lots = calculate_lots(entry, sl, risk_usd, symbol)
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
@@ -55,7 +55,7 @@ class MT5Executor:
                 f"FILLED #{result.order} | {action.upper()} {lots} {symbol} @ {executed_price:.5f} | "
                 f"SL: {sl:.5f} | TP: {tp:.5f}"
             )
-            journal.open_trade(symbol, action, executed_price, sl, tp, lots, risk_usd, result.order)
+            journal.open_trade(symbol, action, executed_price, sl, tp, lots, risk_usd, result.order, score=score, setup_score=setup_score)
         else:
             err = result.comment if result else str(mt5.last_error())
             log.error(f"FAILED | {symbol} {action} | {err} (retcode: {result.retcode if result else 'N/A'})")

@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../common/prisma.service';
+import { withRetry } from '../common/utils/retry.utils';
 
 @Injectable()
 export class InternalService {
@@ -9,21 +10,24 @@ export class InternalService {
 
   // ── Signal logging (v7: stores score + factor breakdown) ──────────────
   async logSignal(data: any) {
-    const signal = await this.prisma.signal.create({
-      data: {
-        ticker:  data.ticker,
-        action:  data.action,
-        entry:   data.entry,
-        sl:      data.sl,
-        tp:      data.tp,
-        rr:      data.rr,
-        bias1h:  data.bias1h  ?? 'HTF',
-        bias4h:  data.bias4h  ?? 'HTF',
-        aligned: data.aligned ?? true,
-        score:   data.score   ?? null,   // v7: 0–100
-        factors: data.factors ?? null,   // v7: {trend,sweep,disp,atr,vol}
-      },
-    });
+    const signal = await withRetry(
+      () => this.prisma.signal.create({
+        data: {
+          ticker:  data.ticker,
+          action:  data.action,
+          entry:   data.entry,
+          sl:      data.sl,
+          tp:      data.tp,
+          rr:      data.rr,
+          bias1h:  data.bias1h  ?? 'HTF',
+          bias4h:  data.bias4h  ?? 'HTF',
+          aligned: data.aligned ?? true,
+          score:   data.score   ?? null,
+          factors: data.factors ?? null,
+        },
+      }),
+      3, 1000, 'logSignal'
+    );
     this.logger.log(
       `Signal | ${data.ticker} ${data.action.toUpperCase()} | ` +
       `Score: ${data.score ?? '?'}/100 | RR 1:${data.rr?.toFixed(2)}`,
@@ -33,22 +37,25 @@ export class InternalService {
 
   // ── Trade open ────────────────────────────────────────────────────────
   async openTrade(data: any) {
-    const trade = await this.prisma.trade.create({
-      data: {
-        ticker:       data.ticker,
-        action:       data.action,
-        entry:        data.entry,
-        sl:           data.sl,
-        tp:           data.tp,
-        lots:         data.lots,
-        riskUsd:      data.riskUsd,
-        mt5Ticket:    data.mt5Ticket ? String(data.mt5Ticket) : null,
-        status:       'OPEN',
-        openedAt:     new Date(),
-        scoreAtEntry: data.scoreAtEntry ?? null,
-        setupScore:   data.setupScore   ?? null,
-      },
-    });
+    const trade = await withRetry(
+      () => this.prisma.trade.create({
+        data: {
+          ticker:       data.ticker,
+          action:       data.action,
+          entry:        data.entry,
+          sl:           data.sl,
+          tp:           data.tp,
+          lots:         data.lots,
+          riskUsd:      data.riskUsd,
+          mt5Ticket:    data.mt5Ticket ? String(data.mt5Ticket) : null,
+          status:       'OPEN',
+          openedAt:     new Date(),
+          scoreAtEntry: data.scoreAtEntry ?? null,
+          setupScore:   data.setupScore   ?? null,
+        },
+      }),
+      3, 1000, 'openTrade'
+    );
     this.logger.log(
       `Trade OPEN | #${data.mt5Ticket} | ${data.ticker} ${data.action} ` +
       `${data.lots} lots | Risk $${data.riskUsd} | Score: ${data.scoreAtEntry ?? '?'}`,
@@ -58,34 +65,40 @@ export class InternalService {
 
   // ── Trade failed ──────────────────────────────────────────────────────
   async failTrade(data: any) {
-    const trade = await this.prisma.trade.create({
-      data: {
-        ticker:   data.ticker,
-        action:   data.action,
-        entry:    data.entry,
-        sl:       data.sl,
-        tp:       data.tp,
-        lots:     data.lots,
-        riskUsd:  data.riskUsd,
-        status:   'FAILED',
-        errorMsg: data.error,
-      },
-    });
+    const trade = await withRetry(
+      () => this.prisma.trade.create({
+        data: {
+          ticker:   data.ticker,
+          action:   data.action,
+          entry:    data.entry,
+          sl:       data.sl,
+          tp:       data.tp,
+          lots:     data.lots,
+          riskUsd:  data.riskUsd,
+          status:   'FAILED',
+          errorMsg: data.error,
+        },
+      }),
+      3, 1000, 'failTrade'
+    );
     this.logger.error(`Trade FAILED | ${data.ticker} | ${data.error}`);
     return trade;
   }
 
   // ── Trade closed (MT5 ticket stored as string for MongoDB) ────────────
   async closeTrade(data: any) {
-    await this.prisma.trade.updateMany({
-      where: { mt5Ticket: String(data.mt5Ticket) },
-      data: {
-        status:      'CLOSED',
-        closedAt:    new Date(),
-        closeReason: data.reason,
-        pnl:         data.pnl,
-      },
-    });
+    await withRetry(
+      () => this.prisma.trade.updateMany({
+        where: { mt5Ticket: String(data.mt5Ticket) },
+        data: {
+          status:      'CLOSED',
+          closedAt:    new Date(),
+          closeReason: data.reason,
+          pnl:         data.pnl,
+        },
+      }),
+      3, 1000, 'closeTrade'
+    );
     this.logger.log(
       `Trade CLOSED | #${data.mt5Ticket} | Reason: ${data.reason} | PnL: $${data.pnl?.toFixed(2)}`,
     );
@@ -94,37 +107,49 @@ export class InternalService {
 
   // ── Breakeven marker ──────────────────────────────────────────────────
   async setBreakeven(ticket: string) {
-    await this.prisma.trade.updateMany({
-      where: { mt5Ticket: String(ticket) },
-      data:  { breakevenSet: true },
-    });
+    await withRetry(
+      () => this.prisma.trade.updateMany({
+        where: { mt5Ticket: String(ticket) },
+        data:  { breakevenSet: true },
+      }),
+      3, 1000, 'setBreakeven'
+    );
     this.logger.log(`Breakeven set | #${ticket}`);
     return { ok: true };
   }
 
   // ── Partial close marker (new: +1.5R partial exit) ────────────────────
   async setPartialClosed(ticket: string) {
-    await this.prisma.trade.updateMany({
-      where: { mt5Ticket: String(ticket) },
-      data:  { partialClosed: true },
-    });
+    await withRetry(
+      () => this.prisma.trade.updateMany({
+        where: { mt5Ticket: String(ticket) },
+        data:  { partialClosed: true },
+      }),
+      3, 1000, 'setPartialClosed'
+    );
     this.logger.log(`Partial close recorded | #${ticket}`);
     return { ok: true };
   }
 
   // ── Open trades list ──────────────────────────────────────────────────
   async getOpenTrades() {
-    return this.prisma.trade.findMany({ where: { status: 'OPEN' } });
+    return withRetry(
+      () => this.prisma.trade.findMany({ where: { status: 'OPEN' } }),
+      3, 1000, 'getOpenTrades'
+    );
   }
 
   // ── Daily PnL ─────────────────────────────────────────────────────────
   async getTodayPnl() {
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
-    const trades = await this.prisma.trade.findMany({
-      where: { status: 'CLOSED', closedAt: { gte: startOfDay } },
-      select: { pnl: true },
-    });
+    const trades = await withRetry(
+      () => this.prisma.trade.findMany({
+        where: { status: 'CLOSED', closedAt: { gte: startOfDay } },
+        select: { pnl: true },
+      }),
+      3, 1000, 'getTodayPnl'
+    );
     return {
       pnl:   trades.reduce((sum, t) => sum + (t.pnl ?? 0), 0),
       count: trades.length,
@@ -134,15 +159,18 @@ export class InternalService {
   // ── Weekly PnL (ISO week) ─────────────────────────────────────────────
   async getWeekPnl() {
     const now   = new Date();
-    const day   = now.getDay() || 7;                    // Mon=1 … Sun=7
+    const day   = now.getDay() || 7;
     const startOfWeek = new Date(now);
-    startOfWeek.setDate(now.getDate() - (day - 1));     // rewind to Monday
+    startOfWeek.setDate(now.getDate() - (day - 1));
     startOfWeek.setHours(0, 0, 0, 0);
 
-    const trades = await this.prisma.trade.findMany({
-      where: { status: 'CLOSED', closedAt: { gte: startOfWeek } },
-      select: { pnl: true },
-    });
+    const trades = await withRetry(
+      () => this.prisma.trade.findMany({
+        where: { status: 'CLOSED', closedAt: { gte: startOfWeek } },
+        select: { pnl: true },
+      }),
+      3, 1000, 'getWeekPnl'
+    );
     return {
       pnl:   trades.reduce((sum, t) => sum + (t.pnl ?? 0), 0),
       count: trades.length,

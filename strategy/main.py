@@ -28,21 +28,27 @@ logging.basicConfig(
 if __name__ == "__main__":
     StrategyEngine(
         symbols = [
+            # Forex & Metals
             "EURUSDm", "GBPUSDm", "XAUUSDm",
             "USDJPYm", "USDCADm",
             "EURJPYm", "GBPJPYm",
             "XAGUSDm",
+            # Crypto
             "BTCUSDm", "ETHUSDm",
+            # Indices (Nasdaq, S&P, Dow, DAX)
+            "NAS100m", "US500m", "US30m", "GER40m",
+            # Stocks
+            "AAPL.m", "TSLA.m", "NVDA.m", "MSFT.m", "AMZN.m"
         ],
         timeframe_entry       = "M5",
-        left_bars             = 8,       # Pine: leftBars
-        right_bars            = 8,       # Pine: rightBars
-        min_rr                = 2.5,     # Pine: minRR
-        min_score             = 80,      # Pine: minScore
+        left_bars             = 4,       # Faster Pivot detection
+        right_bars            = 4,       
+        min_rr                = 2.5,     # Risk Reward
+        min_score             = 70,      # More frequent execution (70/100)
         risk_usd              = 5.0,
         trade_timeout_minutes = 60,
         max_open_trades       = 6,
-        max_pivot_bars        = 120,
+        max_pivot_bars        = 288,     # 24-hour memory (on M5)
         # ── Timezone / Session Target ──
         # Important for Nigerian (WAT) & UK traders: 
         # MT5 timestamps are in your BROKER's timezone. Your specific broker is using exactly UTC (Lagos Time - 1).

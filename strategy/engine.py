@@ -145,12 +145,35 @@ class StrategyEngine:
         end_h, end_m = int(self.session_end), int((self.session_end % 1) * 60)
         log.info(f"Targeting Session: {start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} Broker Time")
         
+        # --- STARTUP TELEGRAM ALERT ---
+        current_time_utc = datetime.now(timezone.utc)
+        decimal_now = current_time_utc.hour + (current_time_utc.minute / 60.0)
+        in_session = self.session_start <= decimal_now < self.session_end
+        session_status = "✅ ACTIVE" if in_session else "⏳ WAITING FOR SESSION"
+        
+        startup_msg = (
+            f"🤖 *TTFM BOT STARTED*\n"
+            f"Status: {session_status}\n"
+            f"Session: {start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC\n"
+            f"Symbols: {len(self.symbols)}\n"
+            f"Risk/Trade: ${self.risk_usd}\n"
+            f"Min Score: {self.min_score}"
+        )
+        send_telegram_alert(startup_msg)
+        
+        last_heartbeat = time.time()
+        
         for symbol in self.symbols:
             if not mt5.symbol_select(symbol, True):
                 log.error(f"Failed to select {symbol} in Market Watch.")
 
         while True:
             try:
+                # --- HEARTBEAT ALERT every 15 mins ---
+                if time.time() - last_heartbeat > 900: # 15 mins
+                    heartbeat_msg = f"💓 *HEARTBEAT* | Bot is scanning markets...\nMT5 Time: {datetime.now(timezone.utc).strftime('%H:%M')} UTC"
+                    send_telegram_alert(heartbeat_msg)
+                    last_heartbeat = time.time()
                 # ── Guard: Cooldown Circuit Breaker ──────────────────────
                 if self._cooldown_until and datetime.now(timezone.utc) < self._cooldown_until:
                     # Still in cooldown
@@ -485,25 +508,28 @@ class StrategyEngine:
         risk_fraction   = score_pct / 100.0
         calculated_risk = self.risk_usd * risk_fraction
 
+        # Map engine action to factor keys (bull/bear)
+        suffix = "bull" if action.lower() == "buy" else "bear"
+        
         log.info(
             f"EXECUTE {symbol} {action.upper()} | "
-            f"Score: {score_pct}/100 | Risk: ${calculated_risk:.2f} | RR: 1:{rr:.1f}\n"
-            f"  Factors → Trend:{factors.get('trend_'+action.lower(), 0)} "
-            f"Sweep:{factors.get('sweep_'+action.lower(), 0)} "
-            f"Disp:{factors.get('disp_'+action.lower(), 0)} "
+            f"Score: {score_pct}/{self.min_score} | Risk: ${calculated_risk:.2f} | RR: 1:{rr:.1f}\n"
+            f"  Factors → Trend:{factors.get('trend_'+suffix, 0)} "
+            f"Sweep:{factors.get('sweep_'+suffix, 0)} "
+            f"Disp:{factors.get('disp_'+suffix, 0)} "
             f"ATR:{factors['vol_score']} Vol:{factors['volm_score']} "
             f"Penalty:-{factors['penalty']}"
         )
 
         # Log to bridge with new factor payload structure
         fact_payload = {
-            "trend": factors.get('trend_'+action.lower(), 0),
-            "sweep": factors.get('sweep_'+action.lower(), 0),
-            "disp":  factors.get('disp_'+action.lower(), 0),
+            "trend": factors.get('trend_'+suffix, 0),
+            "sweep": factors.get('sweep_'+suffix, 0),
+            "disp":  factors.get('disp_'+suffix, 0),
             "atr":   factors['vol_score'],
             "vol":   factors['volm_score'],
-            "aie":   factors.get('aie_'+action.lower(), 0),
-            "vibe":  factors.get('vibe_'+action.lower(), 0),
+            "aie":   factors.get('aie_'+suffix, 0),
+            "vibe":  factors.get('vibe_'+suffix, 0),
             "penalty": factors['penalty']
         }
         
