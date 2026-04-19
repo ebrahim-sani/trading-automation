@@ -13,6 +13,9 @@
       "vibe:init": "cd vibe-trading && py -m cli init",
       "vibe:build": "cd vibe-trading/frontend && npm install && npm run build",
       "vibe:serve": "cd vibe-trading && py -m cli serve --port 8899",
-      "start:visualizer": "cd strategy && py streamlit_dashboard.py"
+      "start:visualizer": "cd strategy && py streamlit_dashboard.py",
+      "backtest": "cd backtester && py run_backtest.py",
+      "optimize": "py backtester/optimize.py",
+      "export-data": "py backtester/export_data_for_finetune.py"
    }
 }

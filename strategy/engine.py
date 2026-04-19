@@ -109,16 +109,13 @@ class StrategyEngine:
         self.max_consec_loss    = max_consecutive_loss
         self.cooldown_hours     = cooldown_hours
 
-        # ── Kronos Foundation Model ──
-        log.info("Initialising Kronos Foundation Model...")
-        try:
-            self.tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-            self.model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
-            self.predictor = KronosPredictor(self.model, self.tokenizer)
-            log.info("Kronos Model Loaded Successfully")
-        except Exception as e:
-            log.error(f"Failed to load Kronos: {e}")
-            self.predictor = None
+        # ── Kronos Prediction Engine ──
+        self.predictors: dict[str, KronosPredictor] = {}
+        self._load_predictors()
+
+        # ── Optimized Parameters DNA ──
+        self.symbol_configs: dict[str, dict] = {}
+        self._load_optimized_params()
 
         self.executor = MT5Executor()
         self.journal  = JournalClient()
@@ -135,6 +132,49 @@ class StrategyEngine:
         self._week_pnl_date:  Optional[int]   = None
         
         self._cooldown_until: Optional[datetime] = None
+
+    def _load_predictors(self):
+        """Loads models for each symbol, prioritizing fine-tuned weights if they exist."""
+        log.info("Loading Kronos Predictors...")
+        
+        # Load base model as fallback
+        try:
+            base_tok = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+            base_mod = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+            fallback_predictor = KronosPredictor(base_mod, base_tok)
+        except Exception as e:
+            log.error(f"Failed to load Kronos Base Model: {e}")
+            fallback_predictor = None
+
+        for sym in self.symbols:
+            # Check for fine-tuned model for this specific symbol
+            ft_path = os.path.join(os.path.dirname(__file__), "..", "Kronos", "finetune_csv", "finetuned", f"EXNESS_{sym}_M5", "basemodel", "best_model")
+            
+            if os.path.exists(ft_path):
+                try:
+                    log.info(f"Loading Fine-Tuned Specialist for {sym}...")
+                    # Fine-tuned models might have specific tokenizer too
+                    tok_path = os.path.join(os.path.dirname(ft_path), "..", "tokenizer", "best_model")
+                    tok = KronosTokenizer.from_pretrained(tok_path) if os.path.exists(tok_path) else base_tok
+                    mod = Kronos.from_pretrained(ft_path)
+                    self.predictors[sym] = KronosPredictor(mod, tok)
+                except Exception as e:
+                    log.error(f"Failed to load fine-tuned model for {sym}: {e}")
+                    self.predictors[sym] = fallback_predictor
+            else:
+                self.predictors[sym] = fallback_predictor
+
+    def _load_optimized_params(self):
+        """Loads genetic optimization results if they exist."""
+        path = os.path.join(os.path.dirname(__file__), "..", "backtester", "optimized_params.json")
+        if os.path.exists(path):
+            try:
+                import json
+                with open(path, "r") as f:
+                    self.symbol_configs = json.load(f)
+                log.info(f"Loaded optimized parameters for {len(self.symbol_configs)} symbols")
+            except Exception as e:
+                log.error(f"Failed to load optimized params: {e}")
 
     def run(self):
         log.info("TTFM Alpha Combiner [v7.1] started")
@@ -161,22 +201,32 @@ class StrategyEngine:
         )
         send_telegram_alert(startup_msg)
         
-        last_heartbeat = time.time()
-        
+        last_heartbeat = 0 # Force immediate first heartbeat
+        last_morning_msg_date = ""
+
         for symbol in self.symbols:
             if not mt5.symbol_select(symbol, True):
                 log.error(f"Failed to select {symbol} in Market Watch.")
 
         while True:
             try:
-                # --- HEARTBEAT ALERT every 15 mins ---
-                if time.time() - last_heartbeat > 900: # 15 mins
-                    heartbeat_msg = f"💓 *HEARTBEAT* | Bot is scanning markets...\nMT5 Time: {datetime.now(timezone.utc).strftime('%H:%M')} UTC"
-                    send_telegram_alert(heartbeat_msg)
+                current_time_utc = datetime.now(timezone.utc)
+                decimal_now = current_time_utc.hour + (current_time_utc.minute / 60.0)
+                in_session = self.session_start <= decimal_now < self.session_end
+                today_str = current_time_utc.strftime("%Y-%m-%d")
+
+                # ── Morning Motivation & Session Briefing ────────────────
+                if in_session and last_morning_msg_date != today_str:
+                    self._send_morning_greeting(start_h, start_m, end_h, end_m)
+                    last_morning_msg_date = today_str
+
+                # ── Heartbeat every 1.5 hours (5400s), ONLY in session ──
+                if in_session and (time.time() - last_heartbeat > 5400):
+                    self._send_heartbeat()
                     last_heartbeat = time.time()
+
                 # ── Guard: Cooldown Circuit Breaker ──────────────────────
-                if self._cooldown_until and datetime.now(timezone.utc) < self._cooldown_until:
-                    # Still in cooldown
+                if self._cooldown_until and current_time_utc < self._cooldown_until:
                     time.sleep(60)
                     continue
                 elif self._cooldown_until:
@@ -327,19 +377,26 @@ class StrategyEngine:
         sweep_bear  = scores["sweep_bear"]
         aie_bull    = scores["aie_bull"]
         aie_bear    = scores["aie_bear"]
+        trend_bull  = scores["trend_bull"]
+        trend_bear  = scores["trend_bear"]
+
+        # Get symbol-specific thresholds
+        config = self.symbol_configs.get(symbol, {})
+        min_score = config.get("min_score", self.min_score)
+        min_rr = config.get("min_rr", self.min_rr)
 
         # If Kronos is active, we check if it supports our bias
         # We don't strictly require Kronos (AIE) to be > 0, but it adds +20 points
-        valid_long  = bull_score >= self.min_score and sweep_bull > 0
-        valid_short = bear_score >= self.min_score and sweep_bear > 0
+        valid_long  = bull_score >= min_score and (sweep_bull > 0 or trend_bull > 0)
+        valid_short = bear_score >= min_score and (sweep_bear > 0 or trend_bear > 0)
 
         # --- TELEGRAM REPORTING ON PRE-FLIGHT ---
         if sweep_bull > 0:
-            status = "🚀 LONG EXECUTING" if valid_long else f"🚫 LONG SKIPPED (Score < {self.min_score})"
+            status = "🚀 LONG EXECUTING" if valid_long else f"🚫 LONG SKIPPED (Score < {min_score})"
             msg = (
                 f"🔎 *SWEEP DETECTED* | {symbol}\n"
                 f"Direction: LONG\n"
-                f"Total Score: {bull_score}/{self.min_score}\n"
+                f"Total Score: {bull_score}/{min_score}\n"
                 f"Status: {status}\n\n"
                 f"*Points Breakdown:*\n"
                 f"• Trend: {scores['trend_bull']}/20\n"
@@ -353,11 +410,11 @@ class StrategyEngine:
             send_telegram_alert(msg)
             
         if sweep_bear > 0:
-            status = "🚀 SHORT EXECUTING" if valid_short else f"🚫 SHORT SKIPPED (Score < {self.min_score})"
+            status = "🚀 SHORT EXECUTING" if valid_short else f"🚫 SHORT SKIPPED (Score < {min_score})"
             msg = (
                 f"🔎 *SWEEP DETECTED* | {symbol}\n"
                 f"Direction: SHORT\n"
-                f"Total Score: {bear_score}/{self.min_score}\n"
+                f"Total Score: {bear_score}/{min_score}\n"
                 f"Status: {status}\n\n"
                 f"*Points Breakdown:*\n"
                 f"• Trend: {scores['trend_bear']}/20\n"
@@ -373,35 +430,26 @@ class StrategyEngine:
         signals = []
 
         if valid_long:
-            sl_long = min(low_c, low_prev) - info.point * 10
+            sl_long_base = min(low_c, np.min(lows[-4:-1])) if len(lows) >= 4 else low_c
+            # Add 2 pips (20 points) breathing room to SL
+            sl_long = sl_long_base - (info.point * 20)
             risk    = close_c - sl_long
             if risk > 0:
-                tp_min  = close_c + risk * self.min_rr
-                tp_max  = close_c + risk * (self.min_rr + 1.0) # Realistic ceiling
-                
-                if top_liq >= tp_min:
-                    # Cap the structural target
-                    tp_long = min(top_liq, tp_max)
-                else:
-                    tp_long = tp_min
-                    
-                rr_long = (tp_long - close_c) / risk
+                # ENFORCE EXACT 1:2 RR
+                tp_long = close_c + risk * min_rr
+                rr_long = min_rr
 
                 signals.append(("buy", close_c, sl_long, tp_long, rr_long, bull_score, scores))
 
         if valid_short:
-            sl_short = max(high_c, high_prev) + info.point * 10
+            sl_short_base = max(high_c, np.max(highs[-4:-1])) if len(highs) >= 4 else high_c
+            # Add 2 pips (20 points) breathing room to SL
+            sl_short = sl_short_base + (info.point * 20)
             risk     = sl_short - close_c
             if risk > 0:
-                tp_min   = close_c - risk * self.min_rr
-                tp_max   = close_c - risk * (self.min_rr + 1.0)
-                
-                if bot_liq <= tp_min:
-                    tp_short = max(bot_liq, tp_max)
-                else:
-                    tp_short = tp_min
-                    
-                rr_short = (close_c - tp_short) / risk
+                # ENFORCE EXACT 1:2 RR
+                tp_short = close_c - risk * min_rr
+                rr_short = min_rr
 
                 signals.append(("sell", close_c, sl_short, tp_short, rr_short, bear_score, scores))
 
@@ -427,10 +475,13 @@ class StrategyEngine:
         trend_bull = int(trend_pts) if (bias_1h == "BULLISH" and bias_4h == "BULLISH") else 0
         trend_bear = int(trend_pts) if (bias_1h == "BEARISH" and bias_4h == "BEARISH") else 0
 
-        # 2. Sweep / Reversion (Gradient based on age of pool)
-        # Sweeping a 10-bar old pool is better than a 100-bar old irrelevant pool.
-        bull_is_sweep = (low_c < bot_liq and close_c > bot_liq)
-        bear_is_sweep = (high_c > top_liq and close_c < top_liq)
+        # 2. Sweep / Reversion
+        # Relaxed from strict pin-bar to a 10-candle window. Allows multi-candle sweeps to trigger.
+        recent_lows = lows[-10:]
+        recent_highs = highs[-10:]
+        
+        bull_is_sweep = (np.min(recent_lows) < bot_liq and close_c > bot_liq)
+        bear_is_sweep = (np.max(recent_highs) > top_liq and close_c < top_liq)
         
         # Penalty increases as age approaches max_pivot_bars. Keep min 10 pts for valid sweep.
         bull_age_mult = 1.0 - (min(bot_age, 80) / 160.0)
@@ -482,6 +533,23 @@ class StrategyEngine:
 
         # 7. Vibe Institutional Consensus (Smart Money Concepts)
         vibe_bull, vibe_bear = self._get_vibe_consensus(symbol, bars)
+        
+        # Determine ADX for Dynamic Ensemble Weighting
+        # (ADX is calculated in the Trend Strength section earlier in this function)
+        # We find trend_strength calculation around line 415-420.
+        # ADX was computed as part of macro trend logic.
+        
+        # Dynamic Ensemble Weighting based on Volatility (ADX)
+        if adx < 25:
+            vibe_bull = int(vibe_bull * 1.5)
+            vibe_bear = int(vibe_bear * 1.5)
+            aie_bull  = int(aie_bull * 0.5)
+            aie_bear  = int(aie_bear * 0.5)
+        else:
+            vibe_bull = int(vibe_bull * 0.5)
+            vibe_bear = int(vibe_bear * 0.5)
+            aie_bull  = int(aie_bull * 1.5)
+            aie_bear  = int(aie_bear * 1.5)
 
         total_bull = max(0, trend_bull + sweep_bull + disp_bull + vol_score + volm_score + aie_bull + vibe_bull - spread_penalty)
         total_bear = max(0, trend_bear + sweep_bear + disp_bear + vol_score + volm_score + aie_bear + vibe_bear - spread_penalty)
@@ -608,12 +676,13 @@ class StrategyEngine:
             # Silent fail - don't let Vibe downtime crash the MT5 executor
             return 0, 0
 
-    def _get_aie_score(self, symbol, bars):
+    def _get_aie_score(self, symbol, bars) -> Tuple[int, int]:
         """
         Uses Kronos Foundation Model to predict the next candle.
         Returns bull_aie, bear_aie (0 or 20)
         """
-        if self.predictor is None:
+        predictor = self.predictors.get(symbol)
+        if not predictor:
             return 0, 0
 
         try:
@@ -635,7 +704,7 @@ class StrategyEngine:
             
             # Limit context to lookback (Max 512 for Kronos)
             lookback = min(len(df), 512)
-            pred = self.predictor.predict(
+            pred = predictor.predict(
                 df=input_df.tail(lookback),
                 x_timestamp=x_ts.tail(lookback),
                 y_timestamp=y_ts,
@@ -665,10 +734,43 @@ class StrategyEngine:
                 if k.startswith('H'): return int(k[1:]) * 60
         return 5
 
-    def _get_atr_expansion(
+    def _send_morning_greeting(self, start_h, start_m, end_h, end_m):
+        quotes = [
+            "\"The goal of a successful trader is to make the best trades. Money is secondary.\" — Alexander Elder",
+            "\"In trading, you have to be defensive and aggressive at the same time. If you are not aggressive, you are not going to make money, and if you are not defensive, you are not going to keep money.\" — Paul Tudor Jones",
+            "\"The stock market is a device for transferring money from the impatient to the patient.\" — Warren Buffett",
+            "\"Trading is not for the person who wants to be right. It’s for the person who wants to make money.\" — Mark Douglas",
+            "\"It's not whether you're right or wrong that's important, but how much money you make when you're right and how much you lose when you're wrong.\" — George Soros",
+            "\"Consistency is the key. Plan your trade and trade your plan.\" — Institutional Wisdom",
+            "\"Discipline is doing what needs to be done, even if you don't want to do it.\" — Unknown",
+            "\"Risk comes from not knowing what you're doing.\" — Warren Buffett"
+        ]
+        import random
+        quote = random.choice(quotes)
+        
+        msg = (
+            f"☀️ *GOOD MORNING, CHAMPION!*\n\n"
+            f"📜 _{quote}_\n\n"
+            f"📊 *DAILY SESSION BRIEF*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 Window: `{start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC`\n"
+            f"💎 Assets: `{len(self.symbols)} active symbols`\n"
+            f"🛡️ Daily Risk: `${self.max_daily_loss_usd:.2f}`\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🚀 *Your bot is primed and hunting for A+ setups.*"
+        )
+        send_telegram_alert(msg)
 
-        self, bars: np.ndarray, atr_period: int = 14, sma_period: int = 10
-    ) -> tuple[float, float]:
+    def _send_heartbeat(self):
+        msg = (
+            f"💓 *PULSE CHECK | SYSTEM ACTIVE*\n"
+            f"Your AI engine is currently scanning {len(self.symbols)} pairs with Dynamic Ensemble IQ.\n\n"
+            f"🕙 *Last Pulse:* `{datetime.now(timezone.utc).strftime('%H:%M')} UTC`\n"
+            f"🛰️ *Link Status:* `Healthy`"
+        )
+        send_telegram_alert(msg)
+
+    def _get_atr_expansion(self, bars: np.ndarray, atr_period: int = 14, sma_period: int = 10) -> tuple[float, float]:
         needed = atr_period + sma_period + 3
         if len(bars) < needed:
             return 0.0, 1.0

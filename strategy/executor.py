@@ -131,8 +131,15 @@ class MT5Executor:
                 self._close_position(ticket, "timeout", journal)
                 continue
 
-            # ── 2. Breakeven at +1R ──────────────────────────────────
+            # ── 2. TP1 & Breakeven at 50% Target (+1R) ────────────────
             if not trade.get("breakevenSet") and price_move_in_favour >= risk:
+                # 1. Take TP1 (partial close half)
+                partial_lots = round(pos.volume * 0.50, 2)
+                partial_lots = max(mt5.symbol_info(pos.symbol).volume_min, partial_lots)
+                if partial_lots < pos.volume:
+                    self._partial_close(ticket, pos, partial_lots, "TP1_50p_target", journal)
+                
+                # 2. Move to BE
                 req = {
                     "action":   mt5.TRADE_ACTION_SLTP,
                     "position": ticket,
@@ -142,7 +149,7 @@ class MT5Executor:
                 }
                 result = mt5.order_send(req)
                 if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    log.info(f"Breakeven set on #{ticket} @ {entry:.5f}")
+                    log.info(f"TP1 Taken & Breakeven set on #{ticket} @ {entry:.5f}")
                     journal.set_breakeven(ticket)
                 else:
                     log.error(f"Breakeven failed on #{ticket}: "
