@@ -149,6 +149,7 @@ def parse_args():
     p.add_argument("--session-start", type=float, default=7.5,  help="Session start (decimal UTC hour)")
     p.add_argument("--session-end",   type=float, default=19.0, help="Session end (decimal UTC hour)")
     p.add_argument("--use-ai", action="store_true", help="Enable Kronos and Vibe during backtest (EXTREMELY SLOW)")
+    p.add_argument("--use-dna", action="store_true", help="Use optimized scores/RR from genetic DNA file")
     p.add_argument("--output", type=str, default="backtest_report.html", help="Output HTML path")
     p.add_argument("--no-browser", action="store_true", help="Don't open browser after generating report")
     return p.parse_args()
@@ -156,6 +157,16 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Load DNA if requested
+    dna = {}
+    if args.use_dna:
+        dna_path = Path(__file__).parent / "optimized_params.json"
+        if dna_path.exists():
+            import json
+            with open(dna_path, "r") as f:
+                dna = json.load(f)
+            log.info(f"Loaded DNA for {len(dna)} symbols")
 
     log.info("Initialising MetaTrader5...")
     if not mt5.initialize():
@@ -167,14 +178,24 @@ def main():
 
     results = []
     for symbol in args.symbols:
+        s_score = args.min_score
+        s_rr    = args.min_rr
+        
+        if args.use_dna and symbol in dna:
+            # Enforce hard cap of 80 for action
+            s_score = min(dna[symbol].get("min_score", s_score), 80)
+            s_rr    = dna[symbol].get("min_rr", s_rr)
+            log.info(f"  [DNA] Using {symbol} Optimized Params: Score={s_score}, RR={s_rr}")
+
         if not mt5.symbol_select(symbol, True):
             log.warning(f"  Cannot select {symbol} in Market Watch — skipping")
             continue
+            
         r = backtest_symbol(
             symbol        = symbol,
             days          = args.days,
-            min_score     = args.min_score,
-            min_rr        = args.min_rr,
+            min_score     = s_score,
+            min_rr        = s_rr,
             risk_usd      = args.risk,
             session_start = args.session_start,
             session_end   = args.session_end,

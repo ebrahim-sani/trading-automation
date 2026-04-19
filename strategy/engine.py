@@ -382,7 +382,8 @@ class StrategyEngine:
 
         # Get symbol-specific thresholds
         config = self.symbol_configs.get(symbol, {})
-        min_score = config.get("min_score", self.min_score)
+        # Enforce hard cap of 80 to prevent 'over-filtering'
+        min_score = min(config.get("min_score", self.min_score), 80)
         min_rr = config.get("min_rr", self.min_rr)
 
         # If Kronos is active, we check if it supports our bias
