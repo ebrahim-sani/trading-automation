@@ -357,7 +357,8 @@ class BacktestEngine:
 
             # ── Session filter ─────────────────────────────────────────
             decimal_hour = bar_time.hour + bar_time.minute / 60.0
-            if not (self.session_start <= decimal_hour < self.session_end):
+            is_crypto = "BTC" in self.symbol or "ETH" in self.symbol
+            if not is_crypto and not (self.session_start <= decimal_hour < self.session_end):
                 continue
 
             # ── Only enter new trades if none open ─────────────────────
@@ -484,7 +485,15 @@ class BacktestEngine:
             open_trade.exit_price = last_close
             open_trade.outcome    = "TIMEOUT"
             r = open_trade.rr
-            open_trade.pnl_r   = (last_close - open_trade.entry) / (open_trade.entry - open_trade.sl) if open_trade.direction == "buy" else (open_trade.entry - last_close) / (open_trade.sl - open_trade.entry)
+            # Guard: entry == sl would cause ZeroDivisionError (degenerate trade)
+            safe_risk = abs(open_trade.entry - open_trade.sl)
+            if safe_risk > 0:
+                if open_trade.direction == "buy":
+                    open_trade.pnl_r = (last_close - open_trade.entry) / safe_risk
+                else:
+                    open_trade.pnl_r = (open_trade.entry - last_close) / safe_risk
+            else:
+                open_trade.pnl_r = 0.0
             open_trade.pnl_usd = open_trade.pnl_r * self.risk_usd
             trades.append(open_trade)
 

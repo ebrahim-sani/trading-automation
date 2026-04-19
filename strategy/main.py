@@ -36,9 +36,9 @@ if __name__ == "__main__":
             # Crypto
             "BTCUSDm", "ETHUSDm",
             # Indices (Nasdaq, S&P, Dow, DAX)
-            "NAS100m", "US500m", "US30m", "GER40m",
+            "USTECm", "US500m", "US30m", "DE30m",
             # Stocks
-            "AAPL.m", "TSLA.m", "NVDA.m", "MSFT.m", "AMZN.m"
+            "AAPLm", "TSLAm", "NVDAm", "MSFTm", "AMZNm"
         ],
         timeframe_entry       = "M5",
         left_bars             = 4,       # Faster Pivot detection

@@ -3,7 +3,7 @@ import logging
 import sys
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
@@ -192,21 +192,29 @@ class StrategyEngine:
         session_status = "✅ ACTIVE" if in_session else "⏳ WAITING FOR SESSION"
         
         startup_msg = (
-            f"🤖 *TTFM BOT STARTED*\n"
-            f"Status: {session_status}\n"
-            f"Session: {start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC\n"
-            f"Symbols: {len(self.symbols)}\n"
-            f"Risk/Trade: ${self.risk_usd}\n"
-            f"Min Score: {self.min_score}"
+            f"🚀 *TTFM ALPHA COMBINER V7.1 INITIALIZED*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🟢 *Status:* {session_status}\n"
+            f"🌍 *Session:* `{start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC`\n"
+            f"🎯 *Assets Tracked:* `{len(self.symbols)} active tickers`\n"
+            f"🛡️ *Risk Target:* `${self.risk_usd:.2f} per trade`\n"
+            f"🧬 *DNA Engine:* `Active ({len(self.symbol_configs)} pairs optimized)`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Awaiting market opportunities..._"
         )
         send_telegram_alert(startup_msg)
         
         last_heartbeat = 0 # Force immediate first heartbeat
         last_morning_msg_date = ""
 
+        active_symbols = []
         for symbol in self.symbols:
-            if not mt5.symbol_select(symbol, True):
-                log.error(f"Failed to select {symbol} in Market Watch.")
+            if mt5.symbol_select(symbol, True):
+                active_symbols.append(symbol)
+            else:
+                log.warning(f"Failed to select {symbol} in Market Watch — removing from scan list.")
+        
+        self.symbols = active_symbols
 
         while True:
             try:
@@ -287,7 +295,7 @@ class StrategyEngine:
             return
         
         # Session check (only process completed bars inside the session window)
-        if not self._is_in_session(closed_bar_time):
+        if not self._is_in_session(symbol, closed_bar_time):
             self.last_bar_time[symbol] = closed_bar_time
             return
 
@@ -382,9 +390,13 @@ class StrategyEngine:
 
         # Get symbol-specific thresholds
         config = self.symbol_configs.get(symbol, {})
-        # Enforce hard cap of 80 to prevent 'over-filtering'
-        min_score = min(config.get("min_score", self.min_score), 80)
-        min_rr = config.get("min_rr", self.min_rr)
+        # The optimizer calibrated thresholds against a 100-point system (structural only).
+        # The live engine scores up to 140 (adds Kronos +20, Vibe +20).
+        # Scale by 1.4 so the same quality bar is preserved — e.g. 60/100 → 84/140.
+        # Cap at 112 (= 80/100 × 1.4) to avoid over-filtering.
+        raw_score = config.get("min_score", self.min_score)
+        min_score = min(int(raw_score * 1.4), 112)
+        min_rr    = config.get("min_rr", self.min_rr)
 
         # If Kronos is active, we check if it supports our bias
         # We don't strictly require Kronos (AIE) to be > 0, but it adds +20 points
@@ -393,38 +405,40 @@ class StrategyEngine:
 
         # --- TELEGRAM REPORTING ON PRE-FLIGHT ---
         if sweep_bull > 0:
-            status = "🚀 LONG EXECUTING" if valid_long else f"🚫 LONG SKIPPED (Score < {min_score})"
+            status = "🟢 *EXECUTION AUTHORIZED*" if valid_long else f"🔴 *SKIPPED* (Target Score: {min_score})"
             msg = (
-                f"🔎 *SWEEP DETECTED* | {symbol}\n"
-                f"Direction: LONG\n"
-                f"Total Score: {bull_score}/{min_score}\n"
-                f"Status: {status}\n\n"
-                f"*Points Breakdown:*\n"
-                f"• Trend: {scores['trend_bull']}/20\n"
-                f"• Sweep: {scores['sweep_bull']}/20\n"
-                f"• Displacement: {scores['disp_bull']}/20\n"
-                f"• ATR: {scores['vol_score']}/20\n"
-                f"• Volume: {scores['volm_score']}/20\n"
-                f"• Kronos AI: {scores['aie_bull']}/20\n"
-                f"• Vibe (SMC): {scores['vibe_bull']}/20\n"
+                f"⚡ *LIQUIDITY SWEEP DETECTED* | #{symbol}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🧭 *Direction:* `LONG 📈`\n"
+                f"📊 *DNA Score:* `{bull_score}/{min_score}`\n"
+                f"⚙️ *System Status:* {status}\n\n"
+                f"🔍 *INSTITUTIONAL METRICS*\n"
+                f"├─ 📈 Trend Align: `{scores['trend_bull']}/20`\n"
+                f"├─ 🧹 Sweep Depth: `{scores['sweep_bull']}/20`\n"
+                f"├─ 💨 Displacement: `{scores['disp_bull']}/20`\n"
+                f"├─ 🌊 Volatility (ATR): `{scores['vol_score']}/20`\n"
+                f"├─ 📊 Volume Spike: `{scores['volm_score']}/20`\n"
+                f"├─ 🤖 Kronos AIE: `{scores['aie_bull']}/20`\n"
+                f"└─ 🏦 Vibe (SMC): `{scores['vibe_bull']}/20`\n"
             )
             send_telegram_alert(msg)
             
         if sweep_bear > 0:
-            status = "🚀 SHORT EXECUTING" if valid_short else f"🚫 SHORT SKIPPED (Score < {min_score})"
+            status = "🟢 *EXECUTION AUTHORIZED*" if valid_short else f"🔴 *SKIPPED* (Target Score: {min_score})"
             msg = (
-                f"🔎 *SWEEP DETECTED* | {symbol}\n"
-                f"Direction: SHORT\n"
-                f"Total Score: {bear_score}/{min_score}\n"
-                f"Status: {status}\n\n"
-                f"*Points Breakdown:*\n"
-                f"• Trend: {scores['trend_bear']}/20\n"
-                f"• Sweep: {scores['sweep_bear']}/20\n"
-                f"• Displacement: {scores['disp_bear']}/20\n"
-                f"• ATR: {scores['vol_score']}/20\n"
-                f"• Volume: {scores['volm_score']}/20\n"
-                f"• Kronos AI: {scores['aie_bear']}/20\n"
-                f"• Vibe (SMC): {scores['vibe_bear']}/20\n"
+                f"⚡ *LIQUIDITY SWEEP DETECTED* | #{symbol}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🧭 *Direction:* `SHORT 📉`\n"
+                f"📊 *DNA Score:* `{bear_score}/{min_score}`\n"
+                f"⚙️ *System Status:* {status}\n\n"
+                f"🔍 *INSTITUTIONAL METRICS*\n"
+                f"├─ 📉 Trend Align: `{scores['trend_bear']}/20`\n"
+                f"├─ 🧹 Sweep Depth: `{scores['sweep_bear']}/20`\n"
+                f"├─ 💨 Displacement: `{scores['disp_bear']}/20`\n"
+                f"├─ 🌊 Volatility (ATR): `{scores['vol_score']}/20`\n"
+                f"├─ 📊 Volume Spike: `{scores['volm_score']}/20`\n"
+                f"├─ 🤖 Kronos AIE: `{scores['aie_bear']}/20`\n"
+                f"└─ 🏦 Vibe (SMC): `{scores['vibe_bear']}/20`\n"
             )
             send_telegram_alert(msg)
 
@@ -576,6 +590,9 @@ class StrategyEngine:
 
         risk_fraction   = score_pct / 100.0
         calculated_risk = self.risk_usd * risk_fraction
+        # Guard: score_pct near 0 would send a near-zero lot order to MT5.
+        # Enforce a minimum of 50% of base risk so every executed trade is meaningful.
+        calculated_risk = max(calculated_risk, self.risk_usd * 0.5)
 
         # Map engine action to factor keys (bull/bear)
         suffix = "bull" if action.lower() == "buy" else "bear"
@@ -616,7 +633,11 @@ class StrategyEngine:
     #  TECHNICAL HELPERS
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    def _is_in_session(self, bar_time: int) -> bool:
+    def _is_in_session(self, symbol: str, bar_time: int) -> bool:
+        # Crypto trades 24/7 without session boundary limits
+        if "BTC" in symbol or "ETH" in symbol:
+            return True
+            
         dt = datetime.fromtimestamp(bar_time, tz=timezone.utc)
         decimal_time = dt.hour + (dt.minute / 60.0)
         return self.session_start <= decimal_time < self.session_end
@@ -750,24 +771,26 @@ class StrategyEngine:
         quote = random.choice(quotes)
         
         msg = (
-            f"☀️ *GOOD MORNING, CHAMPION!*\n\n"
+            f"🌅 *GOOD MORNING, CHAMPION*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📜 _{quote}_\n\n"
-            f"📊 *DAILY SESSION BRIEF*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🕒 Window: `{start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC`\n"
-            f"💎 Assets: `{len(self.symbols)} active symbols`\n"
-            f"🛡️ Daily Risk: `${self.max_daily_loss_usd:.2f}`\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🚀 *Your bot is primed and hunting for A+ setups.*"
+            f"📊 *DAILY BRIEFING*\n"
+            f"├─ 🕒 Window: `{start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC`\n"
+            f"├─ 💎 Assets: `{len(self.symbols)} active hunters`\n"
+            f"└─ 🛡️ Risk Cap: `${self.max_daily_loss_usd:.2f} max loss`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🚀 _Algorithms locked. Let's conquer the markets._"
         )
         send_telegram_alert(msg)
 
     def _send_heartbeat(self):
         msg = (
-            f"💓 *PULSE CHECK | SYSTEM ACTIVE*\n"
-            f"Your AI engine is currently scanning {len(self.symbols)} pairs with Dynamic Ensemble IQ.\n\n"
-            f"🕙 *Last Pulse:* `{datetime.now(timezone.utc).strftime('%H:%M')} UTC`\n"
-            f"🛰️ *Link Status:* `Healthy`"
+            f"💓 *SYSTEM PULSE ALIVE*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧠 *AI Engine:* Scanning {len(self.symbols)} pairs\n"
+            f"📉 *Optimization:* Dynamic Ensemble IQ\n\n"
+            f"🕙 *Timestamp:* `{datetime.now(timezone.utc).strftime('%H:%M')} UTC`\n"
+            f"✅ *Status:* `100% Operational`"
         )
         send_telegram_alert(msg)
 
