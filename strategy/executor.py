@@ -131,8 +131,9 @@ class MT5Executor:
                 self._close_position(ticket, "timeout", journal)
                 continue
 
-            # ── 2. TP1 & Breakeven at 50% Target (+1R) ────────────────
-            if not trade.get("breakevenSet") and price_move_in_favour >= risk:
+            # ── 2. TP1 & Breakeven at 50% Target ────────────────
+            tp_distance = abs(tp - entry)
+            if not trade.get("breakevenSet") and price_move_in_favour >= (tp_distance * 0.5):
                 # 1. Take TP1 (partial close half)
                 partial_lots = round(pos.volume * 0.50, 2)
                 partial_lots = max(mt5.symbol_info(pos.symbol).volume_min, partial_lots)
@@ -155,18 +156,18 @@ class MT5Executor:
                     log.error(f"Breakeven failed on #{ticket}: "
                               f"{result.comment if result else mt5.last_error()}")
 
-            # ── 3. Partial close at +1.5R ────────────────────────────
-            if not trade.get("partialClosed") and price_move_in_favour >= risk * 1.5:
+            # ── 3. TP2 (Partial close) at 75% Target ─────────────────
+            if not trade.get("partialClosed") and price_move_in_favour >= (tp_distance * 0.75):
                 partial_lots = round(pos.volume * 0.30, 2)
                 partial_lots = max(
                     mt5.symbol_info(pos.symbol).volume_min,
                     min(partial_lots, pos.volume - mt5.symbol_info(pos.symbol).volume_min),
                 )
                 if partial_lots > 0:
-                    self._partial_close(ticket, pos, partial_lots, "partial_1.5R", journal)
+                    self._partial_close(ticket, pos, partial_lots, "TP2_75p_target", journal)
 
-            # ── 4. Trailing SL once +2R is hit ───────────────────────
-            if trade.get("breakevenSet") and price_move_in_favour >= risk * 2.0:
+            # ── 4. Trailing SL once 85% Target is hit ────────────────
+            if trade.get("breakevenSet") and price_move_in_favour >= (tp_distance * 0.85):
                 atr = self._get_current_atr(pos.symbol)
                 if atr > 0:
                     new_sl = (current - atr * 0.5) if is_buy else (current + atr * 0.5)

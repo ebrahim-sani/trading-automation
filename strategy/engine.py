@@ -391,12 +391,11 @@ class StrategyEngine:
         # Get symbol-specific thresholds
         config = self.symbol_configs.get(symbol, {})
         # The optimizer calibrated thresholds against a 100-point system (structural only).
-        # The live engine scores up to 140 (adds Kronos +20, Vibe +20).
-        # Scale by 1.4 so the same quality bar is preserved — e.g. 60/100 → 84/140.
-        # Cap at 112 (= 80/100 × 1.4) to avoid over-filtering.
+        # Since AI is temporarily disabled, we use the raw score out of 100 directly.
         raw_score = config.get("min_score", self.min_score)
-        min_score = min(int(raw_score * 1.4), 112)
-        min_rr    = config.get("min_rr", self.min_rr)
+        min_score = min(int(raw_score), 100)
+        # Round the rr to 1 decimal place to fix long float issues (e.g. 2.9000000000000004 -> 2.9)
+        min_rr    = round(config.get("min_rr", self.min_rr), 1)
 
         # If Kronos is active, we check if it supports our bias
         # We don't strictly require Kronos (AIE) to be > 0, but it adds +20 points
@@ -543,28 +542,19 @@ class StrategyEngine:
         if avg_spread > 0 and current_spread > avg_spread:
             spread_penalty = int(min(10, ((current_spread - avg_spread) / avg_spread) * 10))
 
-        # 6. AI Edge (Kronos Foundation Model)
-        aie_bull, aie_bear = self._get_aie_score(symbol, bars)
+        # 6. AI Edge (Kronos Foundation Model) -- TEMPORARILY DISABLED
+        aie_bull, aie_bear = 0, 0
 
-        # 7. Vibe Institutional Consensus (Smart Money Concepts)
-        vibe_bull, vibe_bear = self._get_vibe_consensus(symbol, bars)
+        # 7. Vibe Institutional Consensus (Smart Money Concepts) -- TEMPORARILY DISABLED
+        vibe_bull, vibe_bear = 0, 0
         
         # Determine ADX for Dynamic Ensemble Weighting
         # (ADX is calculated in the Trend Strength section earlier in this function)
         # We find trend_strength calculation around line 415-420.
         # ADX was computed as part of macro trend logic.
         
-        # Dynamic Ensemble Weighting based on Volatility (ADX)
-        if adx < 25:
-            vibe_bull = int(vibe_bull * 1.5)
-            vibe_bear = int(vibe_bear * 1.5)
-            aie_bull  = int(aie_bull * 0.5)
-            aie_bear  = int(aie_bear * 0.5)
-        else:
-            vibe_bull = int(vibe_bull * 0.5)
-            vibe_bear = int(vibe_bear * 0.5)
-            aie_bull  = int(aie_bull * 1.5)
-            aie_bear  = int(aie_bear * 1.5)
+        # Dynamic Ensemble Weighting based on Volatility (ADX) -- TEMPORARILY DISABLED
+        # (Skipping ADX weighting since AI is disabled)
 
         total_bull = max(0, trend_bull + sweep_bull + disp_bull + vol_score + volm_score + aie_bull + vibe_bull - spread_penalty)
         total_bear = max(0, trend_bear + sweep_bear + disp_bear + vol_score + volm_score + aie_bear + vibe_bear - spread_penalty)
