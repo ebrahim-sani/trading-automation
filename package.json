@@ -3,7 +3,7 @@
    "version": "2.0.0",
    "description": "TTFM — 100% Local MT5 Auto-Trading System",
    "scripts": {
-      "setup": "npm run setup:bridge && npm run setup:python && npm run setup:vibe && npm run vibe:build && npm run optimize",
+      "setup": "npm run setup:bridge && npm run setup:python && npm run setup:vibe && npm run vibe:build && npm run optimize:quick",
       "setup:bridge": "cd bridge && npm install && npx prisma generate && npx prisma db push",
       "setup:python": "py -m pip install -r requirements.txt -r strategy/requirements.txt",
       "setup:vibe": "cd vibe-trading && py -m pip install -e .",
@@ -16,6 +16,8 @@
       "start:visualizer": "cd strategy && py streamlit_dashboard.py",
       "backtest": "cd backtester && py run_backtest.py",
       "optimize": "py backtester/optimize.py",
+      "optimize:quick": "py backtester/optimize.py --quick",
+      "optimize:full": "py backtester/optimize.py --trials 50",
       "export-data": "py backtester/export_data_for_finetune.py"
    }
 }
