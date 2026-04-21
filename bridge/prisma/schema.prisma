@@ -24,12 +24,12 @@ model Signal {
   score      Int?               // v7: 0-100 scoring engine value
   factors    Json?              // v7: breakdown {trend,sweep,disp,atr,vol}
   receivedAt DateTime @default(now())
-  trade      Trade?
+  trades     Trade[]
 }
 
 model Trade {
   id             String    @id @default(auto()) @map("_id") @db.ObjectId
-  signalId       String?   @unique @db.ObjectId
+  signalId       String?   @db.ObjectId
   signal         Signal?   @relation(fields: [signalId], references: [id])
   ticker         String
   action         String

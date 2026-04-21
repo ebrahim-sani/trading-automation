@@ -193,13 +193,13 @@ class StrategyEngine:
         
         startup_msg = (
             f"🚀 *TTFM ALPHA COMBINER V7.1 INITIALIZED*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━━\n"
             f"🟢 *Status:* {session_status}\n"
             f"🌍 *Session:* `{start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC`\n"
             f"🎯 *Assets Tracked:* `{len(self.symbols)} active tickers`\n"
             f"🛡️ *Risk Target:* `${self.risk_usd:.2f} per trade`\n"
             f"🧬 *DNA Engine:* `Active ({len(self.symbol_configs)} pairs optimized)`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━━\n"
             f"_Awaiting market opportunities..._"
         )
         send_telegram_alert(startup_msg)
@@ -255,10 +255,11 @@ class StrategyEngine:
                     continue
 
                 # ── Guard: Consecutive Losses ────────────────────────────
-                if self._check_consecutive_losses():
-                    log.warning(f"{self.max_consec_loss} Consecutive Losses hit. Cooling down for {self.cooldown_hours}h.")
-                    self._cooldown_until = datetime.now(timezone.utc) + timedelta(hours=self.cooldown_hours)
-                    continue
+                # [DISABLED PER REQ] Let the bot trade through variance freely.
+                # if self._check_consecutive_losses():
+                #     log.warning(f"{self.max_consec_loss} Consecutive Losses hit. Cooling down for {self.cooldown_hours}h.")
+                #     self._cooldown_until = datetime.now(timezone.utc) + timedelta(hours=self.cooldown_hours)
+                #     continue
 
                 self.executor.manage_open_trades(self.trade_timeout_min, self.journal)
 
@@ -403,11 +404,12 @@ class StrategyEngine:
         valid_short = bear_score >= min_score and (sweep_bear > 0 or trend_bear > 0)
 
         # --- TELEGRAM REPORTING ON PRE-FLIGHT ---
-        if sweep_bull > 0:
-            status = "🟢 *EXECUTION AUTHORIZED*" if valid_long else f"🔴 *SKIPPED* (Target Score: {min_score})"
+        if valid_long:
+            title = "⚡ *LIQUIDITY SWEEP DETECTED*" if sweep_bull > 0 else "🚀 *INSTITUTIONAL SHIFT DETECTED*"
+            status = "🟢 *EXECUTION AUTHORIZED*"
             msg = (
-                f"⚡ *LIQUIDITY SWEEP DETECTED* | #{symbol}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{title} | #{symbol}\n"
+                f"━━━━━━━━━━━━━━━\n"
                 f"🧭 *Direction:* `LONG 📈`\n"
                 f"📊 *DNA Score:* `{bull_score}/{min_score}`\n"
                 f"⚙️ *System Status:* {status}\n\n"
@@ -416,17 +418,18 @@ class StrategyEngine:
                 f"├─ 🧹 Sweep Depth: `{scores['sweep_bull']}/20`\n"
                 f"├─ 💨 Displacement: `{scores['disp_bull']}/20`\n"
                 f"├─ 🌊 Volatility (ATR): `{scores['vol_score']}/20`\n"
-                f"├─ 📊 Volume Spike: `{scores['volm_score']}/20`\n"
-                f"├─ 🤖 Kronos AIE: `{scores['aie_bull']}/20`\n"
-                f"└─ 🏦 Vibe (SMC): `{scores['vibe_bull']}/20`\n"
+                f"└─ 📊 Volume Spike: `{scores['volm_score']}/20`\n"
+                # f"├─ 🤖 Kronos AIE: `{scores['aie_bull']}/20`\n"
+                # f"└─ 🏦 Vibe (SMC): `{scores['vibe_bull']}/20`\n"
             )
             send_telegram_alert(msg)
             
-        if sweep_bear > 0:
-            status = "🟢 *EXECUTION AUTHORIZED*" if valid_short else f"🔴 *SKIPPED* (Target Score: {min_score})"
+        if valid_short:
+            title = "⚡ *LIQUIDITY SWEEP DETECTED*" if sweep_bear > 0 else "🚀 *INSTITUTIONAL SHIFT DETECTED*"
+            status = "🟢 *EXECUTION AUTHORIZED*"
             msg = (
-                f"⚡ *LIQUIDITY SWEEP DETECTED* | #{symbol}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{title} | #{symbol}\n"
+                f"━━━━━━━━━━━━━━━\n"
                 f"🧭 *Direction:* `SHORT 📉`\n"
                 f"📊 *DNA Score:* `{bear_score}/{min_score}`\n"
                 f"⚙️ *System Status:* {status}\n\n"
@@ -435,9 +438,9 @@ class StrategyEngine:
                 f"├─ 🧹 Sweep Depth: `{scores['sweep_bear']}/20`\n"
                 f"├─ 💨 Displacement: `{scores['disp_bear']}/20`\n"
                 f"├─ 🌊 Volatility (ATR): `{scores['vol_score']}/20`\n"
-                f"├─ 📊 Volume Spike: `{scores['volm_score']}/20`\n"
-                f"├─ 🤖 Kronos AIE: `{scores['aie_bear']}/20`\n"
-                f"└─ 🏦 Vibe (SMC): `{scores['vibe_bear']}/20`\n"
+                f"└─ 📊 Volume Spike: `{scores['volm_score']}/20`\n"
+                # f"├─ 🤖 Kronos AIE: `{scores['aie_bear']}/20`\n"
+                # f"└─ 🏦 Vibe (SMC): `{scores['vibe_bear']}/20`\n"
             )
             send_telegram_alert(msg)
 
@@ -762,13 +765,13 @@ class StrategyEngine:
         
         msg = (
             f"🌅 *GOOD MORNING, CHAMPION*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━\n"
             f"📜 _{quote}_\n\n"
             f"📊 *DAILY BRIEFING*\n"
             f"├─ 🕒 Window: `{start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC`\n"
             f"├─ 💎 Assets: `{len(self.symbols)} active hunters`\n"
             f"└─ 🛡️ Risk Cap: `${self.max_daily_loss_usd:.2f} max loss`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━\n"
             f"🚀 _Algorithms locked. Let's conquer the markets._"
         )
         send_telegram_alert(msg)
@@ -776,7 +779,7 @@ class StrategyEngine:
     def _send_heartbeat(self):
         msg = (
             f"💓 *SYSTEM PULSE ALIVE*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━\n"
             f"🧠 *AI Engine:* Scanning {len(self.symbols)} pairs\n"
             f"📉 *Optimization:* Dynamic Ensemble IQ\n\n"
             f"🕙 *Timestamp:* `{datetime.now(timezone.utc).strftime('%H:%M')} UTC`\n"

@@ -70,7 +70,7 @@ export class JournalService {
       take:    limit,
       orderBy: { receivedAt: 'desc' },
       include: {
-        trade: { select: { status: true, pnl: true, closeReason: true } },
+        trades: { select: { status: true, pnl: true, closeReason: true } },
       },
     });
   }

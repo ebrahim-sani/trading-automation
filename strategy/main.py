@@ -55,7 +55,7 @@ if __name__ == "__main__":
         # 07:30 MT5 Broker Time = 08:30 Lagos Time
         # 19:00 MT5 Broker Time = 20:00 Lagos Time
         session_start_hour    = 7.5,      # 07:30 Broker Time (Starts exactly at 08:30 Nigerian Time)
-        session_end_hour      = 19.0,     # 19:00 Broker Time (Ends exactly at 20:00 Nigerian Time)
+        session_end_hour      = 22.0,     # 22:00 Broker Time (NY Close)
 
         max_daily_loss_usd    = 15.0,    # 3× risk — halt for the day
         max_weekly_loss_usd   = 40.0,    # 8× risk — halt for the week
