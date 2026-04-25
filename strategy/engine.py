@@ -109,10 +109,6 @@ class StrategyEngine:
         self.max_consec_loss    = max_consecutive_loss
         self.cooldown_hours     = cooldown_hours
 
-        # ── Kronos Prediction Engine ──
-        self.predictors: dict[str, KronosPredictor] = {}
-        self._load_predictors()
-
         # ── Optimized Parameters DNA ──
         self.symbol_configs: dict[str, dict] = {}
         self._load_optimized_params()
@@ -122,47 +118,14 @@ class StrategyEngine:
 
         self.last_bar_time: dict[str, int] = {}
 
-        self.top_liq: dict[str, float] = {}
-        self.bot_liq: dict[str, float] = {}
-        # Track the bar index where the pool was formed to calculate age
-        self.top_liq_idx: dict[str, int] = {}
-        self.bot_liq_idx: dict[str, int] = {}
-
         self._week_pnl_cache: Optional[float] = None
         self._week_pnl_date:  Optional[int]   = None
         
         self._cooldown_until: Optional[datetime] = None
-
-    def _load_predictors(self):
-        """Loads models for each symbol, prioritizing fine-tuned weights if they exist."""
-        log.info("Loading Kronos Predictors...")
         
-        # Load base model as fallback
-        try:
-            base_tok = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-            base_mod = Kronos.from_pretrained("NeoQuasar/Kronos-small")
-            fallback_predictor = KronosPredictor(base_mod, base_tok)
-        except Exception as e:
-            log.error(f"Failed to load Kronos Base Model: {e}")
-            fallback_predictor = None
-
-        for sym in self.symbols:
-            # Check for fine-tuned model for this specific symbol
-            ft_path = os.path.join(os.path.dirname(__file__), "..", "Kronos", "finetune_csv", "finetuned", f"EXNESS_{sym}_M5", "basemodel", "best_model")
-            
-            if os.path.exists(ft_path):
-                try:
-                    log.info(f"Loading Fine-Tuned Specialist for {sym}...")
-                    # Fine-tuned models might have specific tokenizer too
-                    tok_path = os.path.join(os.path.dirname(ft_path), "..", "tokenizer", "best_model")
-                    tok = KronosTokenizer.from_pretrained(tok_path) if os.path.exists(tok_path) else base_tok
-                    mod = Kronos.from_pretrained(ft_path)
-                    self.predictors[sym] = KronosPredictor(mod, tok)
-                except Exception as e:
-                    log.error(f"Failed to load fine-tuned model for {sym}: {e}")
-                    self.predictors[sym] = fallback_predictor
-            else:
-                self.predictors[sym] = fallback_predictor
+        # ── CMP Zone Memory (5 zones per symbol) ──
+        self.active_zones: dict[str, list[dict]] = {s: [] for s in self.symbols}
+        self.MAX_ZONES = 5
 
     def _load_optimized_params(self):
         """Loads genetic optimization results if they exist."""
@@ -193,13 +156,13 @@ class StrategyEngine:
         
         startup_msg = (
             f"🚀 *TTFM ALPHA COMBINER V7.1 INITIALIZED*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━━\n"
             f"🟢 *Status:* {session_status}\n"
             f"🌍 *Session:* `{start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC`\n"
             f"🎯 *Assets Tracked:* `{len(self.symbols)} active tickers`\n"
             f"🛡️ *Risk Target:* `${self.risk_usd:.2f} per trade`\n"
             f"🧬 *DNA Engine:* `Active ({len(self.symbol_configs)} pairs optimized)`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━━\n"
             f"_Awaiting market opportunities..._"
         )
         send_telegram_alert(startup_msg)
@@ -255,10 +218,11 @@ class StrategyEngine:
                     continue
 
                 # ── Guard: Consecutive Losses ────────────────────────────
-                if self._check_consecutive_losses():
-                    log.warning(f"{self.max_consec_loss} Consecutive Losses hit. Cooling down for {self.cooldown_hours}h.")
-                    self._cooldown_until = datetime.now(timezone.utc) + timedelta(hours=self.cooldown_hours)
-                    continue
+                # [DISABLED PER REQ] Let the bot trade through variance freely.
+                # if self._check_consecutive_losses():
+                #     log.warning(f"{self.max_consec_loss} Consecutive Losses hit. Cooling down for {self.cooldown_hours}h.")
+                #     self._cooldown_until = datetime.now(timezone.utc) + timedelta(hours=self.cooldown_hours)
+                #     continue
 
                 self.executor.manage_open_trades(self.trade_timeout_min, self.journal)
 
@@ -269,6 +233,10 @@ class StrategyEngine:
                     self._last_heartbeat = current_time
 
                 for symbol in self.symbols:
+                    # ── CMP Step A: Monitor for live retests ─────────────
+                    self._check_zone_retests(symbol)
+                    
+                    # ── CMP Step B: Process new bar closures ────────────
                     self._process_symbol(symbol)
 
                 time.sleep(5)
@@ -286,8 +254,8 @@ class StrategyEngine:
         mt5.shutdown()
 
     def _process_symbol(self, symbol: str):
-        bars = mt5.copy_rates_from_pos(symbol, self.tf_entry, 0, 350)
-        if bars is None or len(bars) < self.left_bars + self.right_bars + 30:
+        bars = mt5.copy_rates_from_pos(symbol, self.tf_entry, 0, 10)
+        if bars is None or len(bars) < 3:
             return
 
         closed_bar_time = int(bars[-2]["time"])
@@ -300,275 +268,117 @@ class StrategyEngine:
             return
 
         self.last_bar_time[symbol] = closed_bar_time
-        log.info(f"[{symbol}] Processing candle @ {datetime.fromtimestamp(closed_bar_time, tz=timezone.utc).strftime('%H:%M')} — Recalculating Factor Scores...")
+        log.info(f"[{symbol}] Processing candle @ {datetime.fromtimestamp(closed_bar_time, tz=timezone.utc).strftime('%H:%M')} — Checking CMP Zones...")
 
-        opens  = np.array([b["open"]        for b in bars])
-        highs  = np.array([b["high"]        for b in bars])
-        lows   = np.array([b["low"]         for b in bars])
-        closes = np.array([b["close"]       for b in bars])
-        vols   = np.array([b["tick_volume"] for b in bars])
-
-        open_c  = float(opens[-2])
-        high_c  = float(highs[-2])
-        low_c   = float(lows[-2])
-        close_c = float(closes[-2])
-        vol_c   = float(vols[-2])
-        
-        # Track relative bar index for age
-        current_idx = len(bars) - 2
-
-        high_prev = float(highs[-3])
-        low_prev  = float(lows[-3])
+        open_c  = float(bars[-2]["open"])
+        high_c  = float(bars[-2]["high"])
+        low_c   = float(bars[-2]["low"])
+        close_c = float(bars[-2]["close"])
 
         info = mt5.symbol_info(symbol)
 
-        # ── Safety guard: news spike ─────────────────────────────────
-        atr = self._get_atr(bars[:-1], 14)
-        if self._is_spike_market(highs[:-1], lows[:-1], atr):
-            return
-
-        # ── Update persistent liquidity pools + their age ────────────
-        new_high, nh_idx = self._last_pivot_high_with_idx(highs[:-1])
-        new_low, nl_idx  = self._last_pivot_low_with_idx(lows[:-1])
-        
-        if new_high is not None:
-            self.top_liq[symbol] = new_high
-            self.top_liq_idx[symbol] = current_idx - (len(highs[:-1]) - 1 - nh_idx)
-        else:
-            self.top_liq.pop(symbol, None)
-            self.top_liq_idx.pop(symbol, None)
-
-        if new_low is not None:
-            self.bot_liq[symbol] = new_low
-            self.bot_liq_idx[symbol] = current_idx - (len(lows[:-1]) - 1 - nl_idx)
-        else:
-            self.bot_liq.pop(symbol, None)
-            self.bot_liq_idx.pop(symbol, None)
-
-        top_liq = self.top_liq.get(symbol)
-        bot_liq = self.bot_liq.get(symbol)
-        if top_liq is None or bot_liq is None:
-            return
-
-        top_age = current_idx - self.top_liq_idx.get(symbol, current_idx)
-        bot_age = current_idx - self.bot_liq_idx.get(symbol, current_idx)
-
-        # ── Spread check ─────────────────────────────────────────────
-        avg_spread = self._get_avg_spread(symbol)
-        current_spread = info.spread
-
-        # ── Compute all 5 factors ────────────────────────────────────
-        scores = self._score_factors(
-            symbol    = symbol,
-            bars      = bars,
-            open_c    = open_c,
-            high_c    = high_c,
-            low_c     = low_c,
-            close_c   = close_c,
-            vol_c     = vol_c,
-            top_liq   = top_liq,
-            bot_liq   = bot_liq,
-            top_age   = top_age,
-            bot_age   = bot_age,
-            highs     = highs,
-            lows      = lows,
-            closes    = closes,
-            vols      = vols,
-            atr       = atr,
-            current_spread = current_spread,
-            avg_spread     = avg_spread
-        )
-
-        bull_score  = scores["total_bull"]
-        bear_score  = scores["total_bear"]
-        sweep_bull  = scores["sweep_bull"]
-        sweep_bear  = scores["sweep_bear"]
-        aie_bull    = scores["aie_bull"]
-        aie_bear    = scores["aie_bear"]
-        trend_bull  = scores["trend_bull"]
-        trend_bear  = scores["trend_bear"]
+        # CMP Logic: Support = Bullish Candle, Resistance = Bearish Candle
+        is_bullish = close_c > open_c
+        is_bearish = close_c < open_c
 
         # Get symbol-specific thresholds
         config = self.symbol_configs.get(symbol, {})
-        # The optimizer calibrated thresholds against a 100-point system (structural only).
-        # Since AI is temporarily disabled, we use the raw score out of 100 directly.
-        raw_score = config.get("min_score", self.min_score)
-        min_score = min(int(raw_score), 100)
-        # Round the rr to 1 decimal place to fix long float issues (e.g. 2.9000000000000004 -> 2.9)
         min_rr    = round(config.get("min_rr", self.min_rr), 1)
 
-        # If Kronos is active, we check if it supports our bias
-        # We don't strictly require Kronos (AIE) to be > 0, but it adds +20 points
-        valid_long  = bull_score >= min_score and (sweep_bull > 0 or trend_bull > 0)
-        valid_short = bear_score >= min_score and (sweep_bear > 0 or trend_bear > 0)
-
-        # --- TELEGRAM REPORTING ON PRE-FLIGHT ---
-        if sweep_bull > 0:
-            status = "🟢 *EXECUTION AUTHORIZED*" if valid_long else f"🔴 *SKIPPED* (Target Score: {min_score})"
-            msg = (
-                f"⚡ *LIQUIDITY SWEEP DETECTED* | #{symbol}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🧭 *Direction:* `LONG 📈`\n"
-                f"📊 *DNA Score:* `{bull_score}/{min_score}`\n"
-                f"⚙️ *System Status:* {status}\n\n"
-                f"🔍 *INSTITUTIONAL METRICS*\n"
-                f"├─ 📈 Trend Align: `{scores['trend_bull']}/20`\n"
-                f"├─ 🧹 Sweep Depth: `{scores['sweep_bull']}/20`\n"
-                f"├─ 💨 Displacement: `{scores['disp_bull']}/20`\n"
-                f"├─ 🌊 Volatility (ATR): `{scores['vol_score']}/20`\n"
-                f"├─ 📊 Volume Spike: `{scores['volm_score']}/20`\n"
-                f"├─ 🤖 Kronos AIE: `{scores['aie_bull']}/20`\n"
-                f"└─ 🏦 Vibe (SMC): `{scores['vibe_bull']}/20`\n"
-            )
-            send_telegram_alert(msg)
-            
-        if sweep_bear > 0:
-            status = "🟢 *EXECUTION AUTHORIZED*" if valid_short else f"🔴 *SKIPPED* (Target Score: {min_score})"
-            msg = (
-                f"⚡ *LIQUIDITY SWEEP DETECTED* | #{symbol}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🧭 *Direction:* `SHORT 📉`\n"
-                f"📊 *DNA Score:* `{bear_score}/{min_score}`\n"
-                f"⚙️ *System Status:* {status}\n\n"
-                f"🔍 *INSTITUTIONAL METRICS*\n"
-                f"├─ 📉 Trend Align: `{scores['trend_bear']}/20`\n"
-                f"├─ 🧹 Sweep Depth: `{scores['sweep_bear']}/20`\n"
-                f"├─ 💨 Displacement: `{scores['disp_bear']}/20`\n"
-                f"├─ 🌊 Volatility (ATR): `{scores['vol_score']}/20`\n"
-                f"├─ 📊 Volume Spike: `{scores['volm_score']}/20`\n"
-                f"├─ 🤖 Kronos AIE: `{scores['aie_bear']}/20`\n"
-                f"└─ 🏦 Vibe (SMC): `{scores['vibe_bear']}/20`\n"
-            )
-            send_telegram_alert(msg)
-
-        signals = []
-
-        if valid_long:
-            sl_long_base = min(low_c, np.min(lows[-4:-1])) if len(lows) >= 4 else low_c
-            # Add 2 pips (20 points) breathing room to SL
-            sl_long = sl_long_base - (info.point * 20)
-            risk    = close_c - sl_long
+        # --- CMP ZONE IDENTIFICATION (Wait for retest) ---
+        new_zone = None
+        
+        if is_bullish:
+            # Support = Bullish Candle (Open to Low)
+            entry = open_c
+            sl    = low_c
+            risk  = entry - sl
             if risk > 0:
-                # ENFORCE EXACT 1:2 RR
-                tp_long = close_c + risk * min_rr
-                rr_long = min_rr
-
-                signals.append(("buy", close_c, sl_long, tp_long, rr_long, bull_score, scores))
-
-        if valid_short:
-            sl_short_base = max(high_c, np.max(highs[-4:-1])) if len(highs) >= 4 else high_c
-            # Add 2 pips (20 points) breathing room to SL
-            sl_short = sl_short_base + (info.point * 20)
-            risk     = sl_short - close_c
+                new_zone = {
+                    "entry": entry, "sl": sl, "tp": entry + (risk * min_rr),
+                    "is_bullish": True, "score": 100, "factors": {},
+                    "active": True, "creation_time": datetime.now(timezone.utc)
+                }
+                self._log_and_alert_zone(symbol, new_zone, "🟢 *SUPPORT ZONE IDENTIFIED*")
+                
+        elif is_bearish:
+            # Resistance = Bearish Candle (Open to High)
+            entry = open_c
+            sl    = high_c
+            risk  = sl - entry
             if risk > 0:
-                # ENFORCE EXACT 1:2 RR
-                tp_short = close_c - risk * min_rr
-                rr_short = min_rr
+                new_zone = {
+                    "entry": entry, "sl": sl, "tp": entry - (risk * min_rr),
+                    "is_bullish": False, "score": 100, "factors": {},
+                    "active": True, "creation_time": datetime.now(timezone.utc)
+                }
+                self._log_and_alert_zone(symbol, new_zone, "🔴 *RESISTANCE ZONE IDENTIFIED*")
 
-                signals.append(("sell", close_c, sl_short, tp_short, rr_short, bear_score, scores))
+        if new_zone:
+            if symbol not in self.active_zones: self.active_zones[symbol] = []
+            self.active_zones[symbol].append(new_zone)
+            if len(self.active_zones[symbol]) > self.MAX_ZONES:
+                self.active_zones[symbol].pop(0)
 
-        signals.sort(key=lambda s: s[5], reverse=True)
-        for action, entry, sl, tp, rr, score_pct, factor_dict in signals:
-            self._handle_signal(symbol, action, entry, sl, tp, rr, score_pct, factor_dict)
-
-    def _score_factors(self, symbol, bars, open_c, high_c, low_c, close_c, vol_c,
-                       top_liq, bot_liq, top_age, bot_age,
-                       highs, lows, closes, vols, atr, current_spread, avg_spread) -> dict:
-        """
-        Calculates gradient-based scores for the 5 factors, mitigating binary cliffs.
-        """
-        # 1. Macro Trend (Gradient based on ADX & Alignment)
-        bias_1h, _ = self._get_htf_bias(symbol, mt5.TIMEFRAME_H1)
-        bias_4h, _ = self._get_htf_bias(symbol, mt5.TIMEFRAME_H4)
-        adx = self._compute_adx(highs[:-1], lows[:-1], closes[:-1], 14)
-        
-        # Max 20 if aligned and ADX > 40. Scale linearly if ADX is between 20-40.
-        trend_strength = max(0.0, min(1.0, (adx - 20) / 20.0))
-        trend_pts = 10 + (10 * trend_strength) # Base 10 if aligned, + up to 10 for strength
-        
-        trend_bull = int(trend_pts) if (bias_1h == "BULLISH" and bias_4h == "BULLISH") else 0
-        trend_bear = int(trend_pts) if (bias_1h == "BEARISH" and bias_4h == "BEARISH") else 0
-
-        # 2. Sweep / Reversion
-        # Relaxed from strict pin-bar to a 10-candle window. Allows multi-candle sweeps to trigger.
-        recent_lows = lows[-10:]
-        recent_highs = highs[-10:]
-        
-        bull_is_sweep = (np.min(recent_lows) < bot_liq and close_c > bot_liq)
-        bear_is_sweep = (np.max(recent_highs) > top_liq and close_c < top_liq)
-        
-        # Penalty increases as age approaches max_pivot_bars. Keep min 10 pts for valid sweep.
-        bull_age_mult = 1.0 - (min(bot_age, 80) / 160.0)
-        bear_age_mult = 1.0 - (min(top_age, 80) / 160.0)
-        
-        sweep_bull = int(20 * bull_age_mult) if bull_is_sweep else 0
-        sweep_bear = int(20 * bear_age_mult) if bear_is_sweep else 0
-
-        # 3. Displacement (Gradient based on body/range fraction)
-        candle_range = high_c - low_c
-        body_size    = abs(close_c - open_c)
-        body_frac    = (body_size / candle_range) if candle_range > 0 else 0
-        
-        # > 50% = valid. Scales to 20 pts at 90% body fraction.
-        disp_pts = 0
-        if body_frac > 0.5:
-            disp_pts = int(10 + (min(1.0, (body_frac - 0.5) / 0.4) * 10))
+    def _check_zone_retests(self, symbol: str):
+        """Monitors live price to see if it retests any identified OHLC zones."""
+        if not self.active_zones.get(symbol):
+            return
             
-        disp_bull = disp_pts if close_c > open_c else 0
-        disp_bear = disp_pts if close_c < open_c else 0
-
-        # 4. ATR Expansion (Gradient based on expansion multiplier)
-        current_atr, avg_atr = self._get_atr_expansion(bars, 14, 10)
-        expansion_ratio = (current_atr / avg_atr) if avg_atr > 0 else 1.0
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick: return
         
-        # > 1.0 = valid. Scales to 20 pts at 1.5x expansion.
-        vol_score = 0
-        if expansion_ratio > 1.0:
-            vol_score = int(10 + (min(1.0, (expansion_ratio - 1.0) / 0.5) * 10))
+        # Check session
+        now_dt = datetime.now(timezone.utc)
+        decimal_now = now_dt.hour + (now_dt.minute / 60.0)
+        if not (self.session_start <= decimal_now < self.session_end):
+            return
 
-        # 5. Volume Spike (Gradient based on spike multiplier)
-        recent_vols = vols[-22:-1]
-        avg_vol     = float(np.mean(recent_vols)) if len(recent_vols) > 0 else 0.0
-        spike_ratio = (vol_c / avg_vol) if avg_vol > 0 else 1.0
-        
-        # > 1.5x = valid. Scales to 20 pts at 3.0x spike.
-        volm_score = 0
-        if spike_ratio > 1.5:
-            volm_score = int(10 + (min(1.0, (spike_ratio - 1.5) / 1.5) * 10))
+        for zone in self.active_zones[symbol]:
+            if not zone["active"]: continue
             
-        # ── Spread Penalty (Microstructure adjustment) ──
-        # Deduct up to 10 points if spread is worse than average
-        spread_penalty = 0
-        if avg_spread > 0 and current_spread > avg_spread:
-            spread_penalty = int(min(10, ((current_spread - avg_spread) / avg_spread) * 10))
+            # Breach check: If price hits SL before retest, deactivate
+            if zone["is_bullish"] and tick.bid < zone["sl"]:
+                zone["active"] = False
+                continue
+            if not zone["is_bullish"] and tick.ask > zone["sl"]:
+                zone["active"] = False
+                continue
 
-        # 6. AI Edge (Kronos Foundation Model) -- TEMPORARILY DISABLED
-        aie_bull, aie_bear = 0, 0
+            # Retest check: Did we touch the Open price of the zone?
+            is_retest = False
+            if zone["is_bullish"] and tick.ask <= zone["entry"]:
+                is_retest = True
+            elif not zone["is_bullish"] and tick.bid >= zone["entry"]:
+                is_retest = True
+                
+            if is_retest:
+                # ── EXECUTION ──
+                log.info(f"[{symbol}] CMP RETEST DETECTED @ {zone['entry']} | Executing...")
+                risk = abs(zone["entry"] - zone["sl"])
+                rr = round(abs(zone["tp"] - zone["entry"]) / risk, 1) if risk > 0 else 0
+                
+                self._handle_signal(
+                    symbol, "buy" if zone["is_bullish"] else "sell",
+                    zone["entry"], zone["sl"], zone["tp"], rr,
+                    zone["score"], zone["factors"]
+                )
+                zone["active"] = False # One entry per zone
 
-        # 7. Vibe Institutional Consensus (Smart Money Concepts) -- TEMPORARILY DISABLED
-        vibe_bull, vibe_bear = 0, 0
-        
-        # Determine ADX for Dynamic Ensemble Weighting
-        # (ADX is calculated in the Trend Strength section earlier in this function)
-        # We find trend_strength calculation around line 415-420.
-        # ADX was computed as part of macro trend logic.
-        
-        # Dynamic Ensemble Weighting based on Volatility (ADX) -- TEMPORARILY DISABLED
-        # (Skipping ADX weighting since AI is disabled)
+    def _log_and_alert_zone(self, symbol, zone, status):
+        """Sends a Telegram alert when a clean OHLC zone is identified."""
+        msg = (
+            f"{status} | #{symbol}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🎯 *Wait Price:* `{zone['entry']:.5f}`\n"
+            f"🛡️ *Stop Loss:* `{zone['sl']:.5f}`\n"
+            f"📊 *Candle Score:* `{zone['score']}/100`\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"_Awaiting price retest for execution..._"
+        )
+        send_telegram_alert(msg)
+        log.info(f"[{symbol}] New Zone: {status} at {zone['entry']}")
 
-        total_bull = max(0, trend_bull + sweep_bull + disp_bull + vol_score + volm_score + aie_bull + vibe_bull - spread_penalty)
-        total_bear = max(0, trend_bear + sweep_bear + disp_bear + vol_score + volm_score + aie_bear + vibe_bear - spread_penalty)
-
-        return {
-            "trend_bull": trend_bull, "trend_bear": trend_bear,
-            "sweep_bull": sweep_bull, "sweep_bear": sweep_bear,
-            "disp_bull":  disp_bull,  "disp_bear":  disp_bear,
-            "vol_score":  vol_score,  "volm_score": volm_score,
-            "aie_bull":   aie_bull,   "aie_bear":   aie_bear,
-            "vibe_bull":  vibe_bull,  "vibe_bear":  vibe_bear,
-            "penalty":    spread_penalty,
-            "total_bull": total_bull, "total_bear": total_bear,
-        }
 
     def _handle_signal(self, symbol, action, entry, sl, tp, rr, score_pct, factors):
         if not self._is_cluster_ok(symbol):
@@ -584,30 +394,13 @@ class StrategyEngine:
         # Enforce a minimum of 50% of base risk so every executed trade is meaningful.
         calculated_risk = max(calculated_risk, self.risk_usd * 0.5)
 
-        # Map engine action to factor keys (bull/bear)
-        suffix = "bull" if action.lower() == "buy" else "bear"
-        
         log.info(
             f"EXECUTE {symbol} {action.upper()} | "
-            f"Score: {score_pct}/{self.min_score} | Risk: ${calculated_risk:.2f} | RR: 1:{rr:.1f}\n"
-            f"  Factors → Trend:{factors.get('trend_'+suffix, 0)} "
-            f"Sweep:{factors.get('sweep_'+suffix, 0)} "
-            f"Disp:{factors.get('disp_'+suffix, 0)} "
-            f"ATR:{factors['vol_score']} Vol:{factors['volm_score']} "
-            f"Penalty:-{factors['penalty']}"
+            f"Score: {score_pct}/{self.min_score} | Risk: ${calculated_risk:.2f} | RR: 1:{rr:.1f}"
         )
 
-        # Log to bridge with new factor payload structure
-        fact_payload = {
-            "trend": factors.get('trend_'+suffix, 0),
-            "sweep": factors.get('sweep_'+suffix, 0),
-            "disp":  factors.get('disp_'+suffix, 0),
-            "atr":   factors['vol_score'],
-            "vol":   factors['volm_score'],
-            "aie":   factors.get('aie_'+suffix, 0),
-            "vibe":  factors.get('vibe_'+suffix, 0),
-            "penalty": factors['penalty']
-        }
+        # Empty payload since we are using CMP OHLC Zones without factors
+        fact_payload = {}
         
         self.journal.log_signal(
             symbol, action, entry, sl, tp, rr, "HTF", "HTF", True, 
@@ -654,97 +447,7 @@ class StrategyEngine:
         
         return all_losses
 
-    def _get_vibe_consensus(self, symbol, bars):
-        """
-        Calls Vibe-Trading Research API to get institutional (SMC) sentiment.
-        Returns vibe_bull, vibe_bear (0 or 20)
-        """
-        try:
-            url = "http://localhost:8899/skills/execute"
-            
-            # Include 'time' column so the server can build a proper datetime index.
-            # BUG FIX: previously 'time' was stripped, causing a broken 1970-epoch index
-            # inside the smartmoneyconcepts library, producing all-zero signals.
-            df_tail = pd.DataFrame(bars).tail(100)
-            data_payload = df_tail[['time', 'open', 'high', 'low', 'close', 'tick_volume']].to_dict('records')
-            
-            resp = requests.post(
-                url,
-                json={
-                    "skill": "smc",
-                    "symbol": symbol,
-                    "data": data_payload
-                },
-                timeout=5
-            )
-            
-            if resp.status_code == 200:
-                signal = resp.json().get("signal", 0)
-                if signal == 1: return 20, 0
-                if signal == -1: return 0, 20
-            
-            return 0, 0
-        except Exception:
-            # Silent fail - don't let Vibe downtime crash the MT5 executor
-            return 0, 0
 
-    def _get_aie_score(self, symbol, bars) -> Tuple[int, int]:
-        """
-        Uses Kronos Foundation Model to predict the next candle.
-        Returns bull_aie, bear_aie (0 or 20)
-        """
-        predictor = self.predictors.get(symbol)
-        if not predictor:
-            return 0, 0
-
-        try:
-            # Prepare data for Kronos
-            df = pd.DataFrame(bars)
-            df.rename(columns={'tick_volume': 'volume'}, inplace=True)
-            df['timestamps'] = pd.to_datetime(df['time'], unit='s')
-            
-            # Kronos needs OHLC
-            input_df = df[['open', 'high', 'low', 'close', 'volume']].copy()
-            # We add a dummy amount column if missing
-            input_df['amount'] = input_df['volume'] * input_df['close']
-            
-            x_ts = df['timestamps']
-            
-            # Predict just 1 candle ahead
-            tf_min = self._get_lookback_minutes()
-            y_ts = pd.Series([x_ts.iloc[-1] + timedelta(minutes=tf_min)])
-            
-            # Limit context to lookback (Max 512 for Kronos)
-            lookback = min(len(df), 512)
-            pred = predictor.predict(
-                df=input_df.tail(lookback),
-                x_timestamp=x_ts.tail(lookback),
-                y_timestamp=y_ts,
-                pred_len=1,
-                T=1.0,
-                verbose=False
-            )
-            
-            p_close = pred['close'].iloc[0]
-            curr_close = df['close'].iloc[-1]
-            
-            # Scale predictive reward
-            if p_close > curr_close:
-                return 20, 0
-            elif p_close < curr_close:
-                return 0, 20
-            
-            return 0, 0
-        except Exception as e:
-            log.warning(f"Kronos Prediction Error on {symbol}: {e}")
-            return 0, 0
-
-    def _get_lookback_minutes(self) -> int:
-        for k, v in TF_MAP.items():
-            if v == self.tf_entry:
-                if k.startswith('M'): return int(k[1:])
-                if k.startswith('H'): return int(k[1:]) * 60
-        return 5
 
     def _send_morning_greeting(self, start_h, start_m, end_h, end_m):
         quotes = [
@@ -762,13 +465,13 @@ class StrategyEngine:
         
         msg = (
             f"🌅 *GOOD MORNING, CHAMPION*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━\n"
             f"📜 _{quote}_\n\n"
             f"📊 *DAILY BRIEFING*\n"
             f"├─ 🕒 Window: `{start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC`\n"
             f"├─ 💎 Assets: `{len(self.symbols)} active hunters`\n"
             f"└─ 🛡️ Risk Cap: `${self.max_daily_loss_usd:.2f} max loss`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━\n"
             f"🚀 _Algorithms locked. Let's conquer the markets._"
         )
         send_telegram_alert(msg)
@@ -776,7 +479,7 @@ class StrategyEngine:
     def _send_heartbeat(self):
         msg = (
             f"💓 *SYSTEM PULSE ALIVE*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━\n"
             f"🧠 *AI Engine:* Scanning {len(self.symbols)} pairs\n"
             f"📉 *Optimization:* Dynamic Ensemble IQ\n\n"
             f"🕙 *Timestamp:* `{datetime.now(timezone.utc).strftime('%H:%M')} UTC`\n"
@@ -784,94 +487,7 @@ class StrategyEngine:
         )
         send_telegram_alert(msg)
 
-    def _get_atr_expansion(self, bars: np.ndarray, atr_period: int = 14, sma_period: int = 10) -> tuple[float, float]:
-        needed = atr_period + sma_period + 3
-        if len(bars) < needed:
-            return 0.0, 1.0
 
-        confirmed = bars[:-1]
-        atr_series = []
-        for offset in range(sma_period - 1, -1, -1):
-            b = confirmed if offset == 0 else confirmed[:-offset]
-            if len(b) >= atr_period + 1:
-                atr_series.append(self._get_atr(b, atr_period))
-
-        if not atr_series:
-            return 0.0, 1.0
-
-        return atr_series[-1], sum(atr_series) / len(atr_series)
-
-    def _is_spike_market(self, highs: np.ndarray, lows: np.ndarray, atr: float, lookback: int = 10) -> bool:
-        if atr <= 0 or len(highs) < lookback:
-            return False
-        recent_highs = highs[-lookback:]
-        recent_lows = lows[-lookback:]
-        max_candle_range = float(np.max(recent_highs - recent_lows))
-        return max_candle_range > atr * 2.5
-
-    def _get_htf_bias(self, symbol: str, timeframe) -> tuple:
-        bars = mt5.copy_rates_from_pos(symbol, timeframe, 0, 201)
-        if bars is None or len(bars) < 201:
-            return "UNKNOWN", 0.0
-        closes  = np.array([b["close"] for b in bars])
-        ema_arr = self._ema(closes, 200)
-        return ("BULLISH" if closes[-2] > ema_arr[-2] else "BEARISH"), float(ema_arr[-2])
-
-    def _compute_adx(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> float:
-        lookback = period * 2
-        if len(closes) < lookback + 1: return 0.0
-        recent = closes[-lookback:]
-        up = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i - 1])
-        down = sum(1 for i in range(1, len(recent)) if recent[i] < recent[i - 1])
-        total = up + down
-        if total < 2: return 0.0
-        dominance = max(up, down) / total
-        return max(0.0, min(100.0, (dominance - 0.5) * 200.0))
-
-    def _get_atr(self, bars: np.ndarray, period: int = 14) -> float:
-        if len(bars) < period + 1: return 0.0
-        tr_list = [
-            max(bars[i]['high'] - bars[i]['low'],
-                abs(bars[i]['high'] - bars[i - 1]['close']),
-                abs(bars[i]['low']  - bars[i - 1]['close']))
-            for i in range(1, len(bars))
-        ]
-        return sum(tr_list[-period:]) / period
-
-    def _ema(self, data: np.ndarray, period: int) -> np.ndarray:
-        k   = 2.0 / (period + 1)
-        out = np.zeros_like(data, dtype=float)
-        out[0] = data[0]
-        for i in range(1, len(data)):
-            out[i] = data[i] * k + out[i - 1] * (1.0 - k)
-        return out
-
-    def _last_pivot_high_with_idx(self, highs: np.ndarray) -> tuple[Optional[float], int]:
-        lb, rb, cap = self.left_bars, self.right_bars, self.max_pivot_bars
-        latest = len(highs) - rb - 1
-        for i in range(latest, lb - 1, -1):
-            if (latest - i) > cap: break
-            pivot = highs[i]
-            if (all(highs[i - j] < pivot for j in range(1, lb + 1)) and
-                    all(highs[i + j] < pivot for j in range(1, rb + 1))):
-                return float(pivot), i
-        return None, 0
-
-    def _last_pivot_low_with_idx(self, lows: np.ndarray) -> tuple[Optional[float], int]:
-        lb, rb, cap = self.left_bars, self.right_bars, self.max_pivot_bars
-        latest = len(lows) - rb - 1
-        for i in range(latest, lb - 1, -1):
-            if (latest - i) > cap: break
-            pivot = lows[i]
-            if (all(lows[i - j] > pivot for j in range(1, lb + 1)) and
-                    all(lows[i + j] > pivot for j in range(1, rb + 1))):
-                return float(pivot), i
-        return None, 0
-
-    def _get_avg_spread(self, symbol: str, bars: int = 100) -> float:
-        data = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, bars)
-        if data is None or len(data) == 0: return 0.0
-        return float(np.mean([b["spread"] for b in data]))
 
     def _is_weekly_limit_hit(self) -> bool:
         current_week = datetime.now().isocalendar()[1]

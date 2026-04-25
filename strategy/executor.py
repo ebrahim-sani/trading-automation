@@ -1,11 +1,57 @@
 import logging
 import MetaTrader5 as mt5
-from datetime import datetime
+import json
+import os
+from datetime import datetime, timedelta, timezone
 from lot_calculator import calculate_lots
 
 log = logging.getLogger("Executor")
 
 class MT5Executor:
+
+    def __init__(self):
+        self.magic = 20260101
+        self.vault_path = os.path.join(os.path.dirname(__file__), "opentrades.json")
+        self._ensure_vault()
+
+    def _ensure_vault(self):
+        if not os.path.exists(self.vault_path):
+            with open(self.vault_path, 'w') as f:
+                json.dump([], f)
+
+    def _get_local_trades(self):
+        try:
+            with open(self.vault_path, 'r') as f:
+                return json.load(f)
+        except: return []
+
+    def _save_local_trades(self, trades):
+        try:
+            with open(self.vault_path, 'w') as f:
+                json.dump(trades, f, indent=4)
+        except Exception as e:
+            log.error(f"Failed to save local vault: {e}")
+
+    def _add_local_trade(self, trade_data):
+        trades = self._get_local_trades()
+        trades = [t for t in trades if t.get("mt5Ticket") != trade_data.get("mt5Ticket")]
+        trades.append(trade_data)
+        self._save_local_trades(trades)
+
+    def _remove_local_trade(self, ticket):
+        trades = self._get_local_trades()
+        new_trades = [t for t in trades if str(t.get("mt5Ticket")) != str(ticket)]
+        self._save_local_trades(new_trades)
+
+    def _update_local_trade(self, ticket, updates):
+        trades = self._get_local_trades()
+        found = False
+        for t in trades:
+            if str(t.get("mt5Ticket")) == str(ticket):
+                t.update(updates)
+                found = True
+        if found:
+            self._save_local_trades(trades)
 
     def init(self) -> bool:
         if not mt5.initialize():
@@ -23,7 +69,6 @@ class MT5Executor:
             return
 
         # ── Spread Shield (Guard 1) ──────────────────────────────────
-        # Check if current spread is significantly wider than average
         if not self._is_spread_ok(symbol):
             log.warning(f"  → Rejected: {symbol} spread is too wide (News/Rollover?)")
             return
@@ -40,8 +85,8 @@ class MT5Executor:
             "price":        price,
             "sl":           sl,
             "tp":           tp,
-            "deviation":    20,        # Max deviation (2 pips on 5-digit brokers)
-            "magic":        20260101,
+            "deviation":    20,
+            "magic":        self.magic,
             "comment":      "TTFM",
             "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": filling,
@@ -51,63 +96,58 @@ class MT5Executor:
 
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             executed_price = result.price if result.price else price
-            log.info(
-                f"FILLED #{result.order} | {action.upper()} {lots} {symbol} @ {executed_price:.5f} | "
-                f"SL: {sl:.5f} | TP: {tp:.5f}"
-            )
+            log.info(f"TRADE OPENED | {symbol} {action} | Ticket #{result.order} | Price {executed_price}")
+            
             journal.open_trade(symbol, action, executed_price, sl, tp, lots, risk_usd, result.order, score=score, setup_score=setup_score)
+            
+            self._add_local_trade({
+                "mt5Ticket":     result.order,
+                "ticker":        symbol,
+                "action":        action,
+                "entry":         executed_price,
+                "sl":            sl,
+                "tp":            tp,
+                "lots":          lots,
+                "openedAt":      datetime.now(timezone.utc).isoformat(),
+                "breakevenSet":  False,
+                "partialClosed": False
+            })
         else:
             err = result.comment if result else str(mt5.last_error())
             log.error(f"FAILED | {symbol} {action} | {err} (retcode: {result.retcode if result else 'N/A'})")
             journal.fail_trade(symbol, action, entry, sl, tp, lots, risk_usd, err)
 
     def _is_spread_ok(self, symbol: str) -> bool:
-        """
-        Institutional Safeguard: Skip trades if the spread is > 2x the normal average.
-        Protects against news-spikes or low-liquidity rollover.
-        """
         info = mt5.symbol_info(symbol)
         if not info: return False
-
         current_spread = info.spread
-
-        # Get historical bars to define 'normal' spread (last 100 bars)
         bars = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 100)
         if bars is None or len(bars) == 0:
-            return True  # Fallback if no history
-
+            return True
         avg_spread = sum(b['spread'] for b in bars) / len(bars)
-
-        # Max limit is 2.5x the average spread
         if current_spread > (avg_spread * 2.5):
             return False
-
         return True
 
     def manage_open_trades(self, timeout_minutes: int, journal):
-        """
-        Checks every open trade for:
-        1. Timeout        → close after timeout_minutes if not yet breakeven
-        2. Breakeven      → move SL to entry once price moved 1R in our favour
-        3. Partial close  → close 30% of position at +1.5R  (NEW)
-        4. Trailing SL    → tighten SL to peak - 0.5×ATR once price > +2R  (NEW)
-        5. Adverse exit   → close trade if price moving strongly against us  (NEW)
-        """
-        db_trades = journal.get_open_trades()
+        local_trades = self._get_local_trades()
+        db_trades = local_trades if local_trades else journal.get_open_trades()
+        
         if not db_trades:
             return
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         for trade in db_trades:
-            ticket = trade.get("mt5_ticket")
+            ticket = trade.get("mt5Ticket")
             if not ticket:
                 continue
 
-            opened  = datetime.fromisoformat(trade["opened_at"])
+            opened_str = trade.get("openedAt") if trade.get("openedAt") else trade.get("opened_at")
+            if not opened_str: continue
+            opened = datetime.fromisoformat(opened_str.replace("Z", "+00:00"))
             age_min = (now - opened).total_seconds() / 60
 
-            # ── Position missing means it hit SL/TP natively in MT5 ──
             positions = mt5.positions_get(ticket=ticket)
             if not positions:
                 self._sync_closed_position(ticket, journal)
@@ -117,30 +157,24 @@ class MT5Executor:
             entry = float(trade["entry"])
             sl    = float(trade["sl"])
             tp    = float(trade["tp"])
-            risk  = abs(entry - sl)
 
             is_buy  = pos.type == mt5.ORDER_TYPE_BUY
             current = pos.price_current
 
             price_move_in_favour = (current - entry) if is_buy else (entry - current)
-            price_move_raw       = abs(current - entry)
 
-            # ── 1. Timeout (only if not yet breakeven) ────────────────
             if age_min >= timeout_minutes and not trade.get("breakevenSet"):
                 log.warning(f"Trade #{ticket} timed out ({age_min:.1f} min) — closing")
                 self._close_position(ticket, "timeout", journal)
                 continue
 
-            # ── 2. TP1 & Breakeven at 50% Target ────────────────
             tp_distance = abs(tp - entry)
             if not trade.get("breakevenSet") and price_move_in_favour >= (tp_distance * 0.5):
-                # 1. Take TP1 (partial close half)
                 partial_lots = round(pos.volume * 0.50, 2)
                 partial_lots = max(mt5.symbol_info(pos.symbol).volume_min, partial_lots)
                 if partial_lots < pos.volume:
                     self._partial_close(ticket, pos, partial_lots, "TP1_50p_target", journal)
                 
-                # 2. Move to BE
                 req = {
                     "action":   mt5.TRADE_ACTION_SLTP,
                     "position": ticket,
@@ -152,29 +186,20 @@ class MT5Executor:
                 if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                     log.info(f"TP1 Taken & Breakeven set on #{ticket} @ {entry:.5f}")
                     journal.set_breakeven(ticket)
-                else:
-                    log.error(f"Breakeven failed on #{ticket}: "
-                              f"{result.comment if result else mt5.last_error()}")
+                    self._update_local_trade(ticket, {"breakevenSet": True})
 
-            # ── 3. TP2 (Partial close) at 75% Target ─────────────────
             if not trade.get("partialClosed") and price_move_in_favour >= (tp_distance * 0.75):
                 partial_lots = round(pos.volume * 0.30, 2)
-                partial_lots = max(
-                    mt5.symbol_info(pos.symbol).volume_min,
-                    min(partial_lots, pos.volume - mt5.symbol_info(pos.symbol).volume_min),
-                )
+                partial_lots = max(mt5.symbol_info(pos.symbol).volume_min, min(partial_lots, pos.volume - mt5.symbol_info(pos.symbol).volume_min))
                 if partial_lots > 0:
                     self._partial_close(ticket, pos, partial_lots, "TP2_75p_target", journal)
 
-            # ── 4. Trailing SL once 85% Target is hit ────────────────
             if trade.get("breakevenSet") and price_move_in_favour >= (tp_distance * 0.85):
                 atr = self._get_current_atr(pos.symbol)
                 if atr > 0:
                     new_sl = (current - atr * 0.5) if is_buy else (current + atr * 0.5)
                     current_sl = pos.sl
-                    # Only tighten SL — never widen it
-                    should_update = (is_buy and new_sl > current_sl) or \
-                                    (not is_buy and new_sl < current_sl)
+                    should_update = (is_buy and new_sl > current_sl) or (not is_buy and new_sl < current_sl)
                     if should_update:
                         req = {
                             "action":   mt5.TRADE_ACTION_SLTP,
@@ -187,19 +212,13 @@ class MT5Executor:
                         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                             log.info(f"Trailing SL updated #{ticket} → {new_sl:.5f} (ATR trail)")
 
-            # ── 5. Adverse momentum exit (if price reversing strongly) ─
-            # Only applies after trade has been open > 5 min and SL moved to BE
             if trade.get("breakevenSet") and age_min > 5:
                 atr = self._get_current_atr(pos.symbol)
                 if atr > 0 and price_move_in_favour < 0 and abs(price_move_in_favour) > atr * 1.5:
-                    log.warning(
-                        f"Trade #{ticket}: Adverse move {price_move_in_favour:.5f} "
-                        f"(>{atr * 1.5:.5f} ATR) — closing to protect BE"
-                    )
+                    log.warning(f"Trade #{ticket}: Adverse move {price_move_in_favour:.5f} — closing to protect BE")
                     self._close_position(ticket, "adverse_momentum", journal)
 
     def _partial_close(self, ticket: int, pos, lots: float, reason: str, journal):
-        """Close a partial portion of an open position."""
         close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
         tick       = mt5.symbol_info_tick(pos.symbol)
         price      = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
@@ -211,24 +230,19 @@ class MT5Executor:
             "type":         close_type,
             "position":     ticket,
             "price":        price,
-            "magic":        20260101,
+            "magic":        self.magic,
             "comment":      f"TTFM {reason}",
             "type_filling": self._get_filling(pos.symbol),
         }
         result = mt5.order_send(request)
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            pnl = (price - pos.price_open) * lots if pos.type == mt5.ORDER_TYPE_BUY \
-                  else (pos.price_open - price) * lots
-            log.info(f"PARTIAL CLOSE #{ticket} | {lots} lots | Reason: {reason} | ~PnL: ${pnl:.2f}")
-            try:
-                journal.set_partial_closed(ticket)
-            except Exception:
-                pass  # journal may not support partial yet
+            log.info(f"PARTIAL CLOSE #{ticket} | {lots} lots | Reason: {reason}")
+            journal.set_partial_closed(ticket)
+            self._update_local_trade(ticket, {"partialClosed": True})
         else:
             log.error(f"Partial close failed #{ticket}: {result.comment if result else mt5.last_error()}")
 
     def _get_current_atr(self, symbol: str, period: int = 14) -> float:
-        """Fetch current ATR(14) from M5 bars for trailing stop calculations."""
         bars = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, period + 2)
         if bars is None or len(bars) < period + 1:
             return 0.0
@@ -257,7 +271,7 @@ class MT5Executor:
             "type":         close_type,
             "position":     ticket,
             "price":        price,
-            "magic":        20260101,
+            "magic":        self.magic,
             "comment":      f"TTFM {reason}",
             "type_filling": self._get_filling(pos.symbol),
         }
@@ -266,20 +280,19 @@ class MT5Executor:
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             log.info(f"CLOSED #{ticket} | Reason: {reason} | PnL: ${pnl:.2f}")
             journal.close_trade(ticket, reason, pnl)
+            self._remove_local_trade(ticket)
         else:
             log.error(f"Close failed #{ticket}: {result.comment if result else mt5.last_error()}")
 
     def _sync_closed_position(self, ticket: int, journal):
-        """
-        Catches positions that disappeared (hit SL or TP natively in MT5)
-        and synchronizes their closed state and final PnL back to the database.
-        """
-        now = datetime.now()
+        """Processes trades that closed natively in MT5 (SL/TP)."""
+        now = datetime.now(timezone.utc)
         from_ts = datetime(2020, 1, 1)
         deals = mt5.history_deals_get(from_ts, now, position=ticket)
 
         if not deals:
             log.warning(f"Could not find history for closed position #{ticket}")
+            self._remove_local_trade(ticket)
             return
 
         pnl = sum(d.profit + d.swap + d.commission for d in deals)
@@ -289,6 +302,7 @@ class MT5Executor:
 
         log.info(f"Position #{ticket} closed natively | Reason: {reason} | PnL: ${pnl:.2f}")
         journal.close_trade(ticket, reason, pnl)
+        self._remove_local_trade(ticket)
 
     def _get_filling(self, symbol: str) -> int:
         info = mt5.symbol_info(symbol)

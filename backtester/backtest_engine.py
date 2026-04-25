@@ -25,12 +25,6 @@ import sys, os
 import numpy as np
 import pandas as pd
 
-try:
-    from model.kronos import Kronos, KronosTokenizer, KronosPredictor
-    import torch
-    KRONOS_AVAILABLE = True
-except ImportError:
-    KRONOS_AVAILABLE = False
 
 log = logging.getLogger("Backtester")
 
@@ -38,6 +32,18 @@ log = logging.getLogger("Backtester")
 # ─────────────────────────────────────────────────────────────────────────
 #  DATA CLASSES
 # ─────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class OHLCZone:
+    entry:      float
+    sl:         float
+    tp:         float
+    is_bullish: bool
+    score:      int
+    factors:    dict
+    creation_idx: int
+    active:     bool = True
+    pnl_usd:    float = 0.0
 
 @dataclass
 class Trade:
@@ -264,43 +270,6 @@ class BacktestEngine:
         self.use_ai = use_ai
 
         self.min_score = min_score
-        
-        self.predictor = None
-        if self.use_ai:
-            if not KRONOS_AVAILABLE:
-                log.warning("Kronos modules not found. AI integration will use Vibe only.")
-            else:
-                try:
-                    device = "cuda" if torch.cuda.is_available() else "cpu"
-                    
-                    # PRIORITY: Load fine-tuned specialist if it exists
-                    ft_path = os.path.join(os.path.dirname(__file__), "..", "Kronos", "finetune_csv", "finetuned", f"EXNESS_{self.symbol}_M5", "basemodel", "best_model")
-                    
-                    if os.path.exists(ft_path):
-                        log.info(f"[{self.symbol}] Loading Fine-Tuned Specialist weights...")
-                        tok_path = os.path.join(os.path.dirname(ft_path), "..", "tokenizer", "best_model")
-                        tok = KronosTokenizer.from_pretrained(tok_path) if os.path.exists(tok_path) else KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-                        mod = Kronos.from_pretrained(ft_path)
-                    else:
-                        tok = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-                        mod = Kronos.from_pretrained("NeoQuasar/Kronos-small")
-                    
-                    self.predictor = KronosPredictor(mod, tok)
-                    log.info(f"[{self.symbol}] KronosPredictor loaded on {device}")
-                except Exception as e:
-                    log.error(f"Failed to load Kronos model: {e}. Running without Kronos.")
-
-        # If not using AI, we auto-scale the threshold down because Kronos (+20) and Vibe (+20) 
-        # are excluded from the test matrix. 
-        if not self.use_ai:
-            if self.min_score > 100:
-                self.min_score = 100
-                
-            orig = self.min_score
-            self.min_score = int((self.min_score / 140.0) * 100.0)
-            log.info(f"[{symbol}] Score auto-scaled: live {orig}/140 -> backtest {self.min_score}/100 (Kronos+Vibe excluded)")
-        else:
-            log.info(f"[{symbol}] Running with AI Enabled (Kronos+Vibe). Max score: 140. Min threshold: {self.min_score}")
 
         # Ensure UTC index
         if self.df.index.tzinfo is None:
@@ -319,164 +288,85 @@ class BacktestEngine:
     # ─── Public API ──────────────────────────────────────────────────────
 
     def run(self) -> BacktestResult:
-        result   = BacktestResult(symbol=self.symbol)
-        trades   = []
+        result = BacktestResult(symbol=self.symbol)
+        trades = []
         open_trade: Optional[Trade] = None
+        
+        # ── Zone Memory (The CMP Strategy Core) ────────────────────────
+        active_zones: List[OHLCZone] = []
+        MAX_ZONES = 5
 
         opens  = self.df["open"].values
         highs  = self.df["high"].values
         lows   = self.df["low"].values
         closes = self.df["close"].values
-        vols   = self.df["volume"].values if "volume" in self.df.columns else np.ones(len(self.df))
         times  = self.df.index
 
-        spreads = (
-            self.df["spread"].values
-            if "spread" in self.df.columns
-            else np.full(len(self.df), self.spread_pts)
-        )
+        start_bar = self.left + self.right + 50
+        total_bars = len(self.df)
+        report_step = max(1, total_bars // 20)
+        log.info(f"[{self.symbol}] Starting backtest on {total_bars} bars...")
 
-        min_bars_needed = self.left + self.right + 50
-        log.info(f"[{self.symbol}] Starting backtest on {len(self.df)} bars...")
+        for i in range(start_bar, total_bars):
+            if i % report_step == 0:
+                log.info(f"  [{self.symbol}] {100 * i / total_bars:3.0f}% complete...")
 
-        persistent_top_liq: Optional[float] = None
-        persistent_bot_liq: Optional[float] = None
-        persistent_top_idx: int = 0
-        persistent_bot_idx: int = 0
-
-        for i in range(min_bars_needed, len(self.df) - 1):
             bar_time = times[i]
-
-            # ── Manage open trade first (forward simulate) ─────────────
-            # This MUST run before the session filter so we can close trades during off-hours
+            
+            # ── 1. Manage existing trade ─────────────────────────────
             if open_trade is not None:
                 open_trade, closed = self._advance_trade(open_trade, i, highs, lows, times)
                 if closed:
                     trades.append(closed)
                     open_trade = None
 
-            # ── Session filter ─────────────────────────────────────────
-            decimal_hour = bar_time.hour + bar_time.minute / 60.0
-            is_crypto = "BTC" in self.symbol or "ETH" in self.symbol
-            if not is_crypto and not (self.session_start <= decimal_hour < self.session_end):
-                continue
-
-            # ── Only enter new trades if none open ─────────────────────
-            if open_trade is not None:
-                continue
-
-            # ── Slice bars up to and including bar i-1 (confirmed candle) ──
+            # ── 2. Identify New Zones from Bar i-1 (Just Closed) ──────
             sl_h = highs[:i]
             sl_l = lows[:i]
             sl_c = closes[:i]
             sl_o = opens[:i]
-            sl_v = vols[:i]
 
-            # ── Spike filter ────────────────────────────────────────────
-            atr = _get_atr(sl_h[-50:], sl_l[-50:], sl_c[-50:], 14)
-            if atr <= 0:
-                continue
-            recent_range = float(np.max(sl_h[-10:] - sl_l[-10:]))
-            if recent_range > atr * 2.5:
-                continue  # spike market
+            is_bullish = sl_c[-1] > sl_o[-1]
+            is_bearish = sl_c[-1] < sl_o[-1]
+                
+            # Create zones (Bullish Candle = Support, Bearish = Resistance)
+            if is_bullish:
+                e, s = float(sl_o[-1]), float(sl_l[-1])
+                if (e - s) > 0:
+                    active_zones.append(OHLCZone(e, s, e + (e-s)*self.min_rr, True, 100, {}, i-1))
+            elif is_bearish:
+                e, s = float(sl_o[-1]), float(sl_h[-1])
+                if (s - e) > 0:
+                    active_zones.append(OHLCZone(e, s, e - (s-e)*self.min_rr, False, 100, {}, i-1))
 
-            # ── Pivot liquidity pools ───────────────────────────────────
-            new_high, nh_idx = _last_pivot_high(sl_h, self.left, self.right, self.max_pivot_bars)
-            new_low,  nl_idx = _last_pivot_low(sl_l, self.left, self.right, self.max_pivot_bars)
+            if len(active_zones) > MAX_ZONES:
+                active_zones.pop(0)
 
-            if new_high is not None:
-                persistent_top_liq = new_high
-                persistent_top_idx = nh_idx
-            if new_low is not None:
-                persistent_bot_liq = new_low
-                persistent_bot_idx = nl_idx
-
-            if persistent_top_liq is None or persistent_bot_liq is None:
-                continue
-
-            top_age = (i - 1) - persistent_top_idx
-            bot_age = (i - 1) - persistent_bot_idx
-
-            # ── Current candle values (i-1 = last confirmed bar) ───────
-            open_c  = float(sl_o[-1])
-            high_c  = float(sl_h[-1])
-            low_c   = float(sl_l[-1])
-            close_c = float(sl_c[-1])
-            vol_c   = float(sl_v[-1])
-            high_prev = float(sl_h[-2])
-            low_prev  = float(sl_l[-2])
-
-            # ── Spread ──────────────────────────────────────────────────
-            current_spread = float(spreads[i - 1])
-            avg_spread     = float(np.mean(spreads[max(0, i - 101):i - 1])) if i > 1 else current_spread
-
-            # ── Score ───────────────────────────────────────────────────
-            scores = self._score_factors(
-                i=i,
-                bar_time=bar_time,
-                open_c=open_c, high_c=high_c, low_c=low_c, close_c=close_c,
-                vol_c=vol_c,
-                top_liq=persistent_top_liq, bot_liq=persistent_bot_liq,
-                top_age=top_age, bot_age=bot_age,
-                highs=sl_h, lows=sl_l, closes=sl_c, vols=sl_v,
-                atr=atr,
-                current_spread=current_spread, avg_spread=avg_spread,
-            )
-
-            bull_score = scores["total_bull"]
-            bear_score = scores["total_bear"]
-            sweep_bull = scores["sweep_bull"]
-            sweep_bear = scores["sweep_bear"]
-            trend_bull = scores["trend_bull"]
-            trend_bear = scores["trend_bear"]
-
-            valid_long  = bull_score >= self.min_score and (sweep_bull > 0 or trend_bull > 0)
-            valid_short = bear_score >= self.min_score and (sweep_bear > 0 or trend_bear > 0)
-
-            # ── Build signals ───────────────────────────────────────────
-            signal = None
-
-            if valid_long:
-                sl_long_base = min(low_c, np.min(sl_l[-3:])) if len(sl_l) >= 3 else low_c
-                # ENFORCE EXACT 1:2 RR + SL BREATHING ROOM
-                # Add 10 points (1 pip) breathing room to SL
-                pip_size = 0.01 if "JPY" in self.symbol else 0.0001
-                sl_long = sl_long_base - pip_size
-                risk    = close_c - sl_long
-                if risk > 0:
-                    tp_long = close_c + risk * 2.0
-                    rr = 2.0
-                    signal = Trade(
-                        symbol=self.symbol, direction="buy",
-                        entry_time=bar_time, entry=close_c,
-                        sl=sl_long, tp=tp_long, rr=rr,
-                        score=bull_score, factors=scores,
-                        entry_bar_idx=i,
-                    )
-
-            if valid_short and (signal is None or bear_score > bull_score):
-                sl_short_base = max(high_c, np.max(sl_h[-3:])) if len(sl_h) >= 3 else high_c
-                # Add 10 points (1 pip) breathing room to SL
-                pip_size = 0.01 if "JPY" in self.symbol else 0.0001
-                sl_short = sl_short_base + pip_size
-                risk     = sl_short - close_c
-                if risk > 0:
-                    tp_short = close_c - risk * 2.0
-                    rr = 2.0
-                    signal = Trade(
-                        symbol=self.symbol, direction="sell",
-                        entry_time=bar_time, entry=close_c,
-                        sl=sl_short, tp=tp_short, rr=rr,
-                        score=bear_score, factors=scores,
-                        entry_bar_idx=i,
-                    )
-
-            if signal is not None:
-                open_trade = signal
-                log.debug(
-                    f"[{self.symbol}] SIGNAL @ {bar_time} | "
-                    f"{signal.direction.upper()} | score={signal.score} | RR={signal.rr:.2f}"
-                )
+            # ── 3. Check for Retest Entry at Current Bar i ───────────
+            # Deactivate zones if price breaches SL before entry
+            for z in active_zones:
+                if z.active:
+                    if (z.is_bullish and lows[i] < z.sl) or (not z.is_bullish and highs[i] > z.sl):
+                        z.active = False
+            
+            # Session filter
+            decimal_hour = bar_time.hour + bar_time.minute / 60.0
+            in_session = ("BTC" in self.symbol or "ETH" in self.symbol) or (self.session_start <= decimal_hour < self.session_end)
+            
+            if open_trade is None and in_session:
+                for z in active_zones:
+                    if not z.active or z.score < self.min_score:
+                        continue
+                    
+                    # Entry trigger: price reaches the Open price level
+                    if (z.is_bullish and lows[i] <= z.entry) or (not z.is_bullish and highs[i] >= z.entry):
+                        open_trade = Trade(
+                            symbol=self.symbol, direction="buy" if z.is_bullish else "sell",
+                            entry_time=bar_time, entry=z.entry, sl=z.sl, tp=z.tp, 
+                            rr=self.min_rr, score=z.score, factors=z.factors, entry_bar_idx=i
+                        )
+                        z.active = False # Deactivate after entry
+                        break 
 
         # Close any still-open trade at end-of-data
         if open_trade is not None:
@@ -605,130 +495,6 @@ class BacktestEngine:
 
         return trade, None
 
-    # ─── Score Factors (mirrors strategy/engine.py _score_factors) ────────
-
-    def _score_factors(
-        self, i: int, bar_time: pd.Timestamp,
-        open_c, high_c, low_c, close_c, vol_c,
-        top_liq, bot_liq, top_age, bot_age,
-        highs, lows, closes, vols,
-        atr, current_spread, avg_spread,
-    ) -> dict:
-
-        # ── 1. Macro Trend ──────────────────────────────────────────────
-        bias_1h = self._htf_bias_at(i, self.df_h1)
-        bias_4h = self._htf_bias_at(i, self.df_h4)
-        adx     = _compute_adx(highs, lows, closes, 14)
-
-        trend_strength = max(0.0, min(1.0, (adx - 20) / 20.0))
-        trend_pts = 10 + (10 * trend_strength)
-
-        trend_bull = int(trend_pts) if (bias_1h == "BULLISH" and bias_4h == "BULLISH") else 0
-        trend_bear = int(trend_pts) if (bias_1h == "BEARISH" and bias_4h == "BEARISH") else 0
-
-        # ── 2. Sweep / Reversion ────────────────────────────────────────
-        recent_lows = lows[-10:]
-        recent_highs = highs[-10:]
-        bull_is_sweep = (np.min(recent_lows) < bot_liq and close_c > bot_liq)
-        bear_is_sweep = (np.max(recent_highs) > top_liq and close_c < top_liq)
-
-        bull_age_mult = 1.0 - (min(bot_age, 80) / 160.0)
-        bear_age_mult = 1.0 - (min(top_age, 80) / 160.0)
-
-        sweep_bull = int(20 * bull_age_mult) if bull_is_sweep else 0
-        sweep_bear = int(20 * bear_age_mult) if bear_is_sweep else 0
-
-        # ── 3. Displacement ─────────────────────────────────────────────
-        candle_range = high_c - low_c
-        body_size    = abs(close_c - open_c)
-        body_frac    = (body_size / candle_range) if candle_range > 0 else 0
-
-        disp_pts = 0
-        if body_frac > 0.5:
-            disp_pts = int(10 + (min(1.0, (body_frac - 0.5) / 0.4) * 10))
-
-        disp_bull = disp_pts if close_c > open_c else 0
-        disp_bear = disp_pts if close_c < open_c else 0
-
-        # ── 4. ATR Expansion ────────────────────────────────────────────
-        sma_p = 10
-        atr_series = []
-        for offset in range(sma_p - 1, -1, -1):
-            end = len(highs) if offset == 0 else -offset
-            sl_h = highs[:end] if end != 0 else highs
-            sl_l = lows[:end]  if end != 0 else lows
-            sl_c = closes[:end] if end != 0 else closes
-            if len(sl_h) >= 15:
-                atr_series.append(_get_atr(sl_h[-30:], sl_l[-30:], sl_c[-30:], 14))
-
-        current_atr = atr_series[-1] if atr_series else atr
-        avg_atr     = float(np.mean(atr_series)) if atr_series else atr
-        expansion_ratio = (current_atr / avg_atr) if avg_atr > 0 else 1.0
-
-        vol_score = 0
-        if expansion_ratio > 1.0:
-            vol_score = int(10 + (min(1.0, (expansion_ratio - 1.0) / 0.5) * 10))
-
-        # ── 5. Volume Spike ─────────────────────────────────────────────
-        recent_vols = vols[-22:-1]
-        avg_vol     = float(np.mean(recent_vols)) if len(recent_vols) > 0 else 0.0
-        spike_ratio = (vol_c / avg_vol) if avg_vol > 0 else 1.0
-
-        volm_score = 0
-        if spike_ratio > 1.5:
-            volm_score = int(10 + (min(1.0, (spike_ratio - 1.5) / 1.5) * 10))
-
-        # ── Spread Penalty ───────────────────────────────────────────────
-        spread_penalty = 0
-        if avg_spread > 0 and current_spread > avg_spread:
-            spread_penalty = int(min(10, ((current_spread - avg_spread) / avg_spread) * 10))
-
-        # 6. AI Edge (Kronos & Vibe)
-        aie_bull, aie_bear = 0, 0
-        vibe_bull, vibe_bear = 0, 0
-        
-        if self.use_ai:
-            aie_bull, aie_bear = self._get_aie_score(bar_time)
-            vibe_bull, vibe_bear = self._get_vibe_consensus(bar_time)
-            
-            # Dynamic Ensemble Weighting based on Volatility (ADX)
-            # If choppy/ranging (ADX < 25), prioritize Vibe SMC structural logic.
-            # If trending (ADX >= 25), prioritize Kronos momentum predictions.
-            if adx < 25:
-                vibe_bull = int(vibe_bull * 1.5)
-                vibe_bear = int(vibe_bear * 1.5)
-                aie_bull  = int(aie_bull * 0.5)
-                aie_bear  = int(aie_bear * 0.5)
-            else:
-                vibe_bull = int(vibe_bull * 0.5)
-                vibe_bear = int(vibe_bear * 0.5)
-                aie_bull  = int(aie_bull * 1.5)
-                aie_bear  = int(aie_bear * 1.5)
-
-        total_bull = max(0, trend_bull + sweep_bull + disp_bull + vol_score + volm_score + aie_bull + vibe_bull - spread_penalty)
-        total_bear = max(0, trend_bear + sweep_bear + disp_bear + vol_score + volm_score + aie_bear + vibe_bear - spread_penalty)
-
-        return {
-            "trend_bull": trend_bull, "trend_bear": trend_bear,
-            "sweep_bull": sweep_bull, "sweep_bear": sweep_bear,
-            "disp_bull":  disp_bull,  "disp_bear":  disp_bear,
-            "vol_score":  vol_score,  "volm_score": volm_score,
-            "aie_bull":   aie_bull,   "aie_bear":   aie_bear,
-            "vibe_bull":  vibe_bull,  "vibe_bear":  vibe_bear,
-            "penalty":    spread_penalty,
-            "total_bull": total_bull, "total_bear": total_bear,
-        }
-
-    def _htf_bias_at(self, m5_bar_idx: int, df_htf: pd.DataFrame) -> str:
-        """Return HTF EMA-200 bias as of the M5 bar's timestamp."""
-        bar_time = self.df.index[m5_bar_idx]
-        subset = df_htf[df_htf.index <= bar_time]
-        if len(subset) < 201:
-            return "UNKNOWN"
-        closes  = subset["close"].values
-        ema_arr = _ema(closes, 200)
-        return "BULLISH" if closes[-1] > ema_arr[-1] else "BEARISH"
-
     # ─── Stats ───────────────────────────────────────────────────────────
 
     def _compute_stats(self, result: BacktestResult):
@@ -776,52 +542,3 @@ class BacktestEngine:
         else:
             result.sharpe_ratio = 0.0
 
-    # ─── AI Fetchers ───────────────────────────────────────────────────────
-    
-    def _get_vibe_consensus(self, bar_time: pd.Timestamp) -> Tuple[int, int]:
-        try:
-            url = "http://localhost:8899/skills/execute"
-            
-            # Extract the bars up to the current bar
-            sub_df = self.df.loc[:bar_time].tail(100).copy()
-            sub_df.reset_index(inplace=True)
-            data_payload = sub_df[['time', 'open', 'high', 'low', 'close', 'volume']].rename(columns={'volume': 'tick_volume'}).to_dict('records')
-            
-            resp = requests.post(url, json={"skill": "smc", "symbol": self.symbol, "data": data_payload}, timeout=1)
-            
-            if resp.status_code == 200:
-                signal = resp.json().get("signal", 0)
-                if signal == 1: return 20, 0
-                if signal == -1: return 0, 20
-        except Exception:
-            pass
-        return 0, 0
-
-    def _get_aie_score(self, bar_time: pd.Timestamp) -> Tuple[int, int]:
-        if self.predictor is None:
-            return 0, 0
-
-        try:
-            sub_df = self.df.loc[:bar_time].tail(512).copy()
-            sub_df.reset_index(inplace=True)
-            sub_df['timestamps'] = sub_df['time']
-            sub_df['amount'] = sub_df['volume'] * sub_df['close']
-            
-            x_ts = sub_df['timestamps']
-            y_ts = pd.Series([x_ts.iloc[-1] + timedelta(minutes=5)])
-            
-            pred = self.predictor.predict(
-                df=sub_df[['open', 'high', 'low', 'close', 'volume', 'amount']],
-                x_timestamp=x_ts,
-                y_timestamp=y_ts
-            )
-            
-            if pred is not None and not pred.empty:
-                val = pred.iloc[0]['close']
-                current_close = sub_df.iloc[-1]['close']
-                if val > current_close: return 20, 0
-                if val < current_close: return 0, 20
-        except Exception as e:
-            log.debug(f"Kronos inference error: {e}")
-            
-        return 0, 0
