@@ -254,11 +254,14 @@ class StrategyEngine:
         mt5.shutdown()
 
     def _process_symbol(self, symbol: str):
-        bars = mt5.copy_rates_from_pos(symbol, self.tf_entry, 0, 10)
-        if bars is None or len(bars) < 3:
+        # Fetch OHLC data
+        df_m5 = self._get_bars(symbol, self.tf_entry, 150)
+        df_h4 = self._get_bars(symbol, self.tf_htf2, 150)
+
+        if df_m5.empty or df_h4.empty:
             return
 
-        closed_bar_time = int(bars[-2]["time"])
+        closed_bar_time = int(df_m5.iloc[-2].name.timestamp())
         if self.last_bar_time.get(symbol) == closed_bar_time:
             return
         
