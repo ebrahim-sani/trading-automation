@@ -91,7 +91,7 @@ def backtest_symbol(
 ) -> BacktestResult | None:
 
     log.info(f"\n{'─'*60}")
-    log.info(f"  Backtesting: {symbol}  |  {days} days  |  min_score={min_score}")
+    log.info(f"  Backtesting [CMP Strategy]: {symbol}  |  {days} days  |  min_rr={min_rr}")
     log.info(f"{'─'*60}")
 
     df_m5 = fetch_bars(symbol, mt5.TIMEFRAME_M5, days)
@@ -213,7 +213,9 @@ def main():
     # ── Aggregate across symbols ─────────────────────────────────────────
     total_trades = sum(r.total for r in results)
     total_wins   = sum(r.wins  for r in results)
-    overall_wr   = (total_wins / total_trades * 100) if total_trades else 0.0
+    total_losses = sum(r.losses for r in results)
+    decisive_trades = total_wins + total_losses
+    overall_wr   = (total_wins / decisive_trades * 100) if decisive_trades else 0.0
 
     log.info("\n" + "═"*60)
     log.info("  ██  OVERALL SUMMARY")

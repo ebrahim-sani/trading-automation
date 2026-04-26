@@ -59,6 +59,9 @@ class Trade:
     entry_bar_idx: int = 0   # bar index at signal time — used for timeout calc
     sl_moved_to_be: bool = False # Track if Stop Loss was moved to Breakeven
     tp1_hit: bool = False        # Track if 50% of TP was reached
+    tp2_hit: bool = False        # Track if 75% of TP was reached
+    trail_sl_active: bool = False # Track if 85% of TP was reached
+    current_weight: float = 1.0  # Remaining position size weight
     
     exit_time:  Optional[datetime] = None
     exit_price: Optional[float]    = None
@@ -231,10 +234,9 @@ class BacktestEngine:
         Whether to enable Kronos/Vibe AI scoring.
     """
 
-    # Live engine max score  = 140 (Trend20 + Sweep20 + Disp20 + ATR20 + Vol20 + AIE20 + Vibe20)
-    # Backtest max score     = 100 (same minus AIE20 + Vibe20 which can't be replayed)
-    LIVE_MAX_SCORE      = 140
-    BACKTEST_MAX_SCORE  = 100
+    # CMP Strategy: No composite scoring. Zones are created from OHLC candle structure.
+    # Quality filter: only create a zone if the candle body >= MIN_BODY_RATIO of total range.
+    MIN_BODY_RATIO = 0.20  # At least 20% body to avoid doji noise
 
     def __init__(
         self,
@@ -343,14 +345,24 @@ class BacktestEngine:
 
             is_bullish = sl_c[-1] > sl_o[-1]
             is_bearish = sl_c[-1] < sl_o[-1]
-                
-            # Create zones ONLY if they align fractally with the HTF zone
-            if is_bullish and valid_bullish_htf:
-                e, s = float(sl_o[-1]), float(sl_l[-1])
+
+            # Quality filter: skip doji / indecision candles
+            last_o = float(sl_o[-1])
+            last_c = float(sl_c[-1])
+            last_h = float(sl_h[-1])
+            last_l = float(sl_l[-1])
+            candle_range = last_h - last_l
+            body = abs(last_c - last_o)
+            body_ratio = body / candle_range if candle_range > 0 else 0
+
+            if body_ratio < self.MIN_BODY_RATIO:
+                pass  # Doji — skip zone creation
+            elif is_bullish and valid_bullish_htf:
+                e, s = last_o, last_l
                 if (e - s) > 0:
                     active_zones.append(OHLCZone(e, s, e + (e-s)*self.min_rr, True, 100, {}, i-1))
             elif is_bearish and valid_bearish_htf:
-                e, s = float(sl_o[-1]), float(sl_h[-1])
+                e, s = last_o, last_h
                 if (s - e) > 0:
                     active_zones.append(OHLCZone(e, s, e - (s-e)*self.min_rr, False, 100, {}, i-1))
 
@@ -370,9 +382,8 @@ class BacktestEngine:
             
             if open_trade is None and in_session:
                 for z in active_zones:
-                    if not z.active or z.score < self.min_score:
+                    if not z.active:
                         continue
-                    
                     # Entry trigger: price reaches the Open price level
                     if (z.is_bullish and lows[i] <= z.entry) or (not z.is_bullish and highs[i] >= z.entry):
                         open_trade = Trade(
@@ -421,77 +432,100 @@ class BacktestEngine:
         t = times[current_bar]
 
         risk = abs(trade.entry - trade.sl) if not trade.sl_moved_to_be else abs(trade.entry - (trade.entry - trade.entry * 0.001)) # safeguard risk div
+        tp_dist = abs(trade.tp - trade.entry)
 
-        if trade.direction == "buy":
-            # TP1 & Breakeven logic
-            if not trade.tp1_hit and risk > 0:
-                midpoint = trade.entry + (trade.tp - trade.entry) * 0.5
-                if h >= midpoint:
+        # Helper to process hits
+        def process_targets(high_price, low_price):
+            if trade.direction == "buy":
+                # TP1 (50%)
+                if not trade.tp1_hit and risk > 0 and high_price >= trade.entry + (tp_dist * 0.5):
                     trade.tp1_hit = True
                     trade.sl = trade.entry
                     trade.sl_moved_to_be = True
-                    # Partial close: Half position is closed at +1R (if RR was 2)
-                    # For a 1:2 trade, midpoint is 1R. 
-                    # If we risk 1%, we make 0.5% here.
-                    trade.pnl_r += 0.5
-                    trade.pnl_usd += self.risk_usd * 0.5
+                    close_weight = 0.5
+                    trade.pnl_r += close_weight * (trade.rr * 0.5)
+                    trade.current_weight -= close_weight
+                # TP2 (75%)
+                if not trade.tp2_hit and risk > 0 and high_price >= trade.entry + (tp_dist * 0.75):
+                    trade.tp2_hit = True
+                    close_weight = 0.3
+                    trade.pnl_r += close_weight * (trade.rr * 0.75)
+                    trade.current_weight -= close_weight
+                # Trailing SL (85%)
+                if not trade.trail_sl_active and risk > 0 and high_price >= trade.entry + (tp_dist * 0.85):
+                    trade.trail_sl_active = True
+                    trade.sl = trade.entry + (tp_dist * 0.5)  # lock in 50% profit for remainder
+            else:
+                # TP1 (50%)
+                if not trade.tp1_hit and risk > 0 and low_price <= trade.entry - (tp_dist * 0.5):
+                    trade.tp1_hit = True
+                    trade.sl = trade.entry
+                    trade.sl_moved_to_be = True
+                    close_weight = 0.5
+                    trade.pnl_r += close_weight * (trade.rr * 0.5)
+                    trade.current_weight -= close_weight
+                # TP2 (75%)
+                if not trade.tp2_hit and risk > 0 and low_price <= trade.entry - (tp_dist * 0.75):
+                    trade.tp2_hit = True
+                    close_weight = 0.3
+                    trade.pnl_r += close_weight * (trade.rr * 0.75)
+                    trade.current_weight -= close_weight
+                # Trailing SL (85%)
+                if not trade.trail_sl_active and risk > 0 and low_price <= trade.entry - (tp_dist * 0.85):
+                    trade.trail_sl_active = True
+                    trade.sl = trade.entry - (tp_dist * 0.5)
 
+        # Process partial targets first
+        process_targets(h, l)
+
+        # Now check full SL or full TP
+        if trade.direction == "buy":
             if l <= trade.sl:
                 trade.exit_time  = t
                 trade.exit_price = trade.sl
-                if trade.tp1_hit:
+                
+                if trade.trail_sl_active:
+                    trade.pnl_r += trade.current_weight * (trade.rr * 0.5)
+                    trade.outcome = "WIN"
+                elif trade.sl_moved_to_be:
                     trade.outcome = "HALF-WIN"
                 else:
                     trade.outcome = "LOSS"
-                    trade.pnl_r   = -1.0
-                    trade.pnl_usd = -self.risk_usd
+                    trade.pnl_r -= trade.current_weight
+                
+                trade.pnl_usd = trade.pnl_r * self.risk_usd
                 return None, trade
 
             if h >= trade.tp:
                 trade.exit_time  = t
                 trade.exit_price = trade.tp
-                if trade.tp1_hit:
-                    trade.outcome = "WIN"
-                    trade.pnl_r   += 1.0 # The other half closed at +2R total (so +1R for half)
-                    trade.pnl_usd += self.risk_usd * 1.0
-                else:
-                    trade.outcome = "WIN"
-                    trade.pnl_r   = trade.rr
-                    trade.pnl_usd = trade.rr * self.risk_usd
+                trade.outcome = "WIN"
+                trade.pnl_r += trade.current_weight * trade.rr
+                trade.pnl_usd = trade.pnl_r * self.risk_usd
                 return None, trade
-        else:  # sell
-            # TP1 & Breakeven logic
-            if not trade.tp1_hit and risk > 0:
-                midpoint = trade.entry - (trade.entry - trade.tp) * 0.5
-                if l <= midpoint:
-                    trade.tp1_hit = True
-                    trade.sl = trade.entry
-                    trade.sl_moved_to_be = True
-                    trade.pnl_r += 0.5
-                    trade.pnl_usd += self.risk_usd * 0.5
-
+        else:
             if h >= trade.sl:
                 trade.exit_time  = t
                 trade.exit_price = trade.sl
-                if trade.tp1_hit:
+                
+                if trade.trail_sl_active:
+                    trade.pnl_r += trade.current_weight * (trade.rr * 0.5)
+                    trade.outcome = "WIN"
+                elif trade.sl_moved_to_be:
                     trade.outcome = "HALF-WIN"
                 else:
                     trade.outcome = "LOSS"
-                    trade.pnl_r   = -1.0
-                    trade.pnl_usd = -self.risk_usd
+                    trade.pnl_r -= trade.current_weight
+
+                trade.pnl_usd = trade.pnl_r * self.risk_usd
                 return None, trade
 
             if l <= trade.tp:
                 trade.exit_time  = t
                 trade.exit_price = trade.tp
-                if trade.tp1_hit:
-                    trade.outcome = "WIN"
-                    trade.pnl_r   += 1.0
-                    trade.pnl_usd += self.risk_usd * 1.0
-                else:
-                    trade.outcome = "WIN"
-                    trade.pnl_r   = trade.rr
-                    trade.pnl_usd = trade.rr * self.risk_usd
+                trade.outcome = "WIN"
+                trade.pnl_r += trade.current_weight * trade.rr
+                trade.pnl_usd = trade.pnl_r * self.risk_usd
                 return None, trade
 
         # Timeout — use stored bar index, no fragile lookup needed
@@ -512,40 +546,44 @@ class BacktestEngine:
 
     def _get_active_htf_zones(self, df_htf: pd.DataFrame) -> List[dict]:
         """
-        Scans the HTF dataframe (e.g. H4) to find structural OHLC zones
-        that have not yet been invalidated by a stop-loss breach.
+        Scans the HTF dataframe (H4) to find structural OHLC zones
+        that have not been invalidated by a stop-loss breach.
+        Only reads CONFIRMED closed bars (excludes the last/current open bar).
         """
         zones = []
-        if len(df_htf) < 2:
+        n = len(df_htf)
+        if n < 2:
             return zones
-            
-        lookback = min(50, len(df_htf) - 1)
-        
-        # 1. Identify all zones in the lookback window
-        for i in range(len(df_htf) - lookback, len(df_htf)):
-            o = float(df_htf.iloc[i]['open'])
-            h = float(df_htf.iloc[i]['high'])
-            l = float(df_htf.iloc[i]['low'])
-            c = float(df_htf.iloc[i]['close'])
-            
-            if c > o: # Bullish = Support
-                zones.append({'entry': o, 'sl': l, 'is_bullish': True, 'active': True, 'idx': i})
-            elif c < o: # Bearish = Resistance
-                zones.append({'entry': o, 'sl': h, 'is_bullish': False, 'active': True, 'idx': i})
-                
-        # 2. Forward pass to eliminate breached zones
+
+        # Only scan confirmed closed bars — stop at n-1 to exclude the live bar
+        confirmed = n - 1
+        lookback = min(50, confirmed)
+        start = confirmed - lookback
+
+        # 1. Build zone list from confirmed bars only
+        for pos in range(start, confirmed):
+            o = float(df_htf.iloc[pos]['open'])
+            h = float(df_htf.iloc[pos]['high'])
+            l = float(df_htf.iloc[pos]['low'])
+            c = float(df_htf.iloc[pos]['close'])
+
+            if c > o:   # Bullish candle → Support zone (Open to Low)
+                zones.append({'entry': o, 'sl': l, 'is_bullish': True,  'active': True, 'pos': pos})
+            elif c < o: # Bearish candle → Resistance zone (Open to High)
+                zones.append({'entry': o, 'sl': h, 'is_bullish': False, 'active': True, 'pos': pos})
+
+        # 2. Forward pass — deactivate zones breached by later confirmed bars
         for z in zones:
-            for i in range(z['idx'] + 1, len(df_htf)):
-                h = float(df_htf.iloc[i]['high'])
-                l = float(df_htf.iloc[i]['low'])
-                
+            for pos in range(z['pos'] + 1, confirmed):
+                h = float(df_htf.iloc[pos]['high'])
+                l = float(df_htf.iloc[pos]['low'])
                 if z['is_bullish'] and l < z['sl']:
                     z['active'] = False
                     break
                 elif not z['is_bullish'] and h > z['sl']:
                     z['active'] = False
                     break
-                    
+
         return [z for z in zones if z['active']]
 
     # ─── Stats ───────────────────────────────────────────────────────────
