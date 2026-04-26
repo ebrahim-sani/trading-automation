@@ -91,7 +91,7 @@ def backtest_symbol(
 ) -> BacktestResult | None:
 
     log.info(f"\n{'─'*60}")
-    log.info(f"  Backtesting: {symbol}  |  {days} days  |  min_score={min_score}")
+    log.info(f"  Backtesting [CMP Strategy]: {symbol}  |  {days} days  |  min_rr={min_rr}")
     log.info(f"{'─'*60}")
 
     df_m5 = fetch_bars(symbol, mt5.TIMEFRAME_M5, days)

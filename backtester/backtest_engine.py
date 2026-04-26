@@ -520,40 +520,44 @@ class BacktestEngine:
 
     def _get_active_htf_zones(self, df_htf: pd.DataFrame) -> List[dict]:
         """
-        Scans the HTF dataframe (e.g. H4) to find structural OHLC zones
-        that have not yet been invalidated by a stop-loss breach.
+        Scans the HTF dataframe (H4) to find structural OHLC zones
+        that have not been invalidated by a stop-loss breach.
+        Only reads CONFIRMED closed bars (excludes the last/current open bar).
         """
         zones = []
-        if len(df_htf) < 2:
+        n = len(df_htf)
+        if n < 2:
             return zones
-            
-        lookback = min(50, len(df_htf) - 1)
-        
-        # 1. Identify all zones in the lookback window
-        for i in range(len(df_htf) - lookback, len(df_htf)):
-            o = float(df_htf.iloc[i]['open'])
-            h = float(df_htf.iloc[i]['high'])
-            l = float(df_htf.iloc[i]['low'])
-            c = float(df_htf.iloc[i]['close'])
-            
-            if c > o: # Bullish = Support
-                zones.append({'entry': o, 'sl': l, 'is_bullish': True, 'active': True, 'idx': i})
-            elif c < o: # Bearish = Resistance
-                zones.append({'entry': o, 'sl': h, 'is_bullish': False, 'active': True, 'idx': i})
-                
-        # 2. Forward pass to eliminate breached zones
+
+        # Only scan confirmed closed bars — stop at n-1 to exclude the live bar
+        confirmed = n - 1
+        lookback = min(50, confirmed)
+        start = confirmed - lookback
+
+        # 1. Build zone list from confirmed bars only
+        for pos in range(start, confirmed):
+            o = float(df_htf.iloc[pos]['open'])
+            h = float(df_htf.iloc[pos]['high'])
+            l = float(df_htf.iloc[pos]['low'])
+            c = float(df_htf.iloc[pos]['close'])
+
+            if c > o:   # Bullish candle → Support zone (Open to Low)
+                zones.append({'entry': o, 'sl': l, 'is_bullish': True,  'active': True, 'pos': pos})
+            elif c < o: # Bearish candle → Resistance zone (Open to High)
+                zones.append({'entry': o, 'sl': h, 'is_bullish': False, 'active': True, 'pos': pos})
+
+        # 2. Forward pass — deactivate zones breached by later confirmed bars
         for z in zones:
-            for i in range(z['idx'] + 1, len(df_htf)):
-                h = float(df_htf.iloc[i]['high'])
-                l = float(df_htf.iloc[i]['low'])
-                
+            for pos in range(z['pos'] + 1, confirmed):
+                h = float(df_htf.iloc[pos]['high'])
+                l = float(df_htf.iloc[pos]['low'])
                 if z['is_bullish'] and l < z['sl']:
                     z['active'] = False
                     break
                 elif not z['is_bullish'] and h > z['sl']:
                     z['active'] = False
                     break
-                    
+
         return [z for z in zones if z['active']]
 
     # ─── Stats ───────────────────────────────────────────────────────────
