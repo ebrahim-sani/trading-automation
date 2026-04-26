@@ -362,6 +362,44 @@ class StrategyEngine:
             if len(self.active_zones[symbol]) > self.MAX_ZONES:
                 self.active_zones[symbol].pop(0)
 
+    def _get_active_htf_zones(self, df_htf: pd.DataFrame) -> List[dict]:
+        """
+        Scans the HTF dataframe (H4) to find structural OHLC zones
+        that have not yet been invalidated by a stop-loss breach.
+        Returns only currently active (unbreached) zones.
+        """
+        zones = []
+        if len(df_htf) < 2:
+            return zones
+
+        lookback = min(50, len(df_htf) - 1)
+
+        # 1. Identify all zones in the lookback window
+        for i in range(len(df_htf) - lookback, len(df_htf) - 1):
+            o = float(df_htf.iloc[i]['open'])
+            h = float(df_htf.iloc[i]['high'])
+            l = float(df_htf.iloc[i]['low'])
+            c = float(df_htf.iloc[i]['close'])
+
+            if c > o:   # Bullish candle = Support zone (Open down to Low)
+                zones.append({'entry': o, 'sl': l, 'is_bullish': True,  'active': True, 'idx': i})
+            elif c < o: # Bearish candle = Resistance zone (Open up to High)
+                zones.append({'entry': o, 'sl': h, 'is_bullish': False, 'active': True, 'idx': i})
+
+        # 2. Forward pass — deactivate any zone whose SL was later breached
+        for z in zones:
+            for i in range(z['idx'] + 1, len(df_htf)):
+                h = float(df_htf.iloc[i]['high'])
+                l = float(df_htf.iloc[i]['low'])
+                if z['is_bullish'] and l < z['sl']:
+                    z['active'] = False
+                    break
+                elif not z['is_bullish'] and h > z['sl']:
+                    z['active'] = False
+                    break
+
+        return [z for z in zones if z['active']]
+
     def _check_zone_retests(self, symbol: str):
         """Monitors live price to see if it retests any identified OHLC zones."""
         if not self.active_zones.get(symbol):
