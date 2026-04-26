@@ -268,6 +268,8 @@ class StrategyEngine:
         df.set_index('time', inplace=True)
         return df
 
+
+
     def _process_symbol(self, symbol: str):
         # Fetch OHLC data
         df_m5 = self._get_bars(symbol, self.tf_entry, 150)
@@ -294,7 +296,7 @@ class StrategyEngine:
         # Check for M5 retests first (using the latest tick data)
         self._check_zone_retests(symbol)
 
-        # ─── HTF Fractal Context (H4 Zones) ─────────────────────────────
+        # --- CMP Zone Identification ---
         htf_zones = self._get_active_htf_zones(df_h4)
 
         # Check if the most recently closed M5 candle closed inside an HTF zone
@@ -315,19 +317,18 @@ class StrategyEngine:
             elif not z['is_bullish'] and z['entry'] <= close_c <= z['sl']:
                 valid_bearish_htf = True
 
-        # ─── LTF Zone Creation (M5) ─────────────────────────────────────
+        # ─── LTF Zone Creation (M5) ────────────────────────────────
         # CMP Logic: Support = Bullish Candle, Resistance = Bearish Candle
         is_bullish = close_c > open_c
         is_bearish = close_c < open_c
 
         # Get symbol-specific thresholds
         config = self.symbol_configs.get(symbol, {})
-        min_rr    = round(config.get("min_rr", self.min_rr), 1)
+        min_rr = round(config.get("min_rr", self.min_rr), 1)
 
-        # --- CMP ZONE IDENTIFICATION (Wait for retest) ---
         new_zone = None
-        
-        if is_bullish:
+
+        if is_bullish and valid_bullish_htf:  # FIXED: require HTF alignment for both directions
             # Support = Bullish Candle (Open to Low)
             entry = open_c
             sl    = low_c
@@ -338,8 +339,8 @@ class StrategyEngine:
                     "is_bullish": True, "score": 100, "factors": {},
                     "active": True, "creation_time": datetime.now(timezone.utc)
                 }
-                self._log_and_alert_zone(symbol, new_zone, "🟢 *LTF SUPPORT ZONE IDENTIFIED (HTF ALIGNED)*")
-                
+                log.info(f"[{symbol}] 🟢 LTF SUPPORT ZONE @ {entry:.5f} (HTF aligned)")
+
         elif is_bearish and valid_bearish_htf:
             # Resistance = Bearish Candle (Open to High)
             entry = open_c
@@ -351,45 +352,12 @@ class StrategyEngine:
                     "is_bullish": False, "score": 100, "factors": {},
                     "active": True, "creation_time": datetime.now(timezone.utc)
                 }
-                self._log_and_alert_zone(symbol, new_zone, "🔴 *LTF RESISTANCE ZONE IDENTIFIED (HTF ALIGNED)*")
+                log.info(f"[{symbol}] 🔴 LTF RESISTANCE ZONE @ {entry:.5f} (HTF aligned)")
 
-    def _get_active_htf_zones(self, df_htf: pd.DataFrame) -> List[dict]:
-        """
-        Scans the HTF dataframe (e.g. H4) to find structural OHLC zones
-        that have not yet been invalidated by a stop-loss breach.
-        """
-        zones = []
-        lookback = min(50, len(df_htf) - 1)
-        
-        # 1. Identify all zones in the lookback window
-        for i in range(len(df_htf) - lookback, len(df_htf) - 1):
-            o = float(df_htf.iloc[i]['open'])
-            h = float(df_htf.iloc[i]['high'])
-            l = float(df_htf.iloc[i]['low'])
-            c = float(df_htf.iloc[i]['close'])
-            
-            if c > o: # Bullish = Support
-                zones.append({'entry': o, 'sl': l, 'is_bullish': True, 'active': True, 'idx': i})
-            elif c < o: # Bearish = Resistance
-                zones.append({'entry': o, 'sl': h, 'is_bullish': False, 'active': True, 'idx': i})
-                
-        # 2. Forward pass to eliminate breached zones
-        for z in zones:
-            for i in range(z['idx'] + 1, len(df_htf)):
-                h = float(df_htf.iloc[i]['high'])
-                l = float(df_htf.iloc[i]['low'])
-                
-                if z['is_bullish'] and l < z['sl']:
-                    z['active'] = False
-                    break
-                elif not z['is_bullish'] and h > z['sl']:
-                    z['active'] = False
-                    break
-                    
-        return [z for z in zones if z['active']]
-
+        # ─── Save to zone memory ─────────────────────────────────────
         if new_zone:
-            if symbol not in self.active_zones: self.active_zones[symbol] = []
+            if symbol not in self.active_zones:
+                self.active_zones[symbol] = []
             self.active_zones[symbol].append(new_zone)
             if len(self.active_zones[symbol]) > self.MAX_ZONES:
                 self.active_zones[symbol].pop(0)

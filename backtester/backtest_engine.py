@@ -231,10 +231,9 @@ class BacktestEngine:
         Whether to enable Kronos/Vibe AI scoring.
     """
 
-    # Live engine max score  = 140 (Trend20 + Sweep20 + Disp20 + ATR20 + Vol20 + AIE20 + Vibe20)
-    # Backtest max score     = 100 (same minus AIE20 + Vibe20 which can't be replayed)
-    LIVE_MAX_SCORE      = 140
-    BACKTEST_MAX_SCORE  = 100
+    # CMP Strategy: No composite scoring. Zones are created from OHLC candle structure.
+    # Quality filter: only create a zone if the candle body >= MIN_BODY_RATIO of total range.
+    MIN_BODY_RATIO = 0.20  # At least 20% body to avoid doji noise
 
     def __init__(
         self,
@@ -343,14 +342,24 @@ class BacktestEngine:
 
             is_bullish = sl_c[-1] > sl_o[-1]
             is_bearish = sl_c[-1] < sl_o[-1]
-                
-            # Create zones ONLY if they align fractally with the HTF zone
-            if is_bullish and valid_bullish_htf:
-                e, s = float(sl_o[-1]), float(sl_l[-1])
+
+            # Quality filter: skip doji / indecision candles
+            last_o = float(sl_o[-1])
+            last_c = float(sl_c[-1])
+            last_h = float(sl_h[-1])
+            last_l = float(sl_l[-1])
+            candle_range = last_h - last_l
+            body = abs(last_c - last_o)
+            body_ratio = body / candle_range if candle_range > 0 else 0
+
+            if body_ratio < self.MIN_BODY_RATIO:
+                pass  # Doji — skip zone creation
+            elif is_bullish and valid_bullish_htf:
+                e, s = last_o, last_l
                 if (e - s) > 0:
                     active_zones.append(OHLCZone(e, s, e + (e-s)*self.min_rr, True, 100, {}, i-1))
             elif is_bearish and valid_bearish_htf:
-                e, s = float(sl_o[-1]), float(sl_h[-1])
+                e, s = last_o, last_h
                 if (s - e) > 0:
                     active_zones.append(OHLCZone(e, s, e - (s-e)*self.min_rr, False, 100, {}, i-1))
 
@@ -370,9 +379,8 @@ class BacktestEngine:
             
             if open_trade is None and in_session:
                 for z in active_zones:
-                    if not z.active or z.score < self.min_score:
+                    if not z.active:
                         continue
-                    
                     # Entry trigger: price reaches the Open price level
                     if (z.is_bullish and lows[i] <= z.entry) or (not z.is_bullish and highs[i] >= z.entry):
                         open_trade = Trade(
