@@ -322,13 +322,20 @@ class StrategyEngine:
         is_bullish = close_c > open_c
         is_bearish = close_c < open_c
 
+        candle_range = high_c - low_c
+        body = abs(close_c - open_c)
+        body_ratio = body / candle_range if candle_range > 0 else 0
+        MIN_BODY_RATIO = 0.20
+
         # Get symbol-specific thresholds
         config = self.symbol_configs.get(symbol, {})
         min_rr = round(config.get("min_rr", self.min_rr), 1)
 
         new_zone = None
 
-        if is_bullish and valid_bullish_htf:  # FIXED: require HTF alignment for both directions
+        if body_ratio < MIN_BODY_RATIO:
+            pass # Doji - skip zone creation
+        elif is_bullish and valid_bullish_htf:  # FIXED: require HTF alignment for both directions
             # Support = Bullish Candle (Open to Low)
             entry = open_c
             sl    = low_c
