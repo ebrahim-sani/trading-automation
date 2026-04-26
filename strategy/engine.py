@@ -108,6 +108,10 @@ class StrategyEngine:
         self.max_weekly_loss_usd = max_weekly_loss_usd or risk_usd * 8
         self.max_consec_loss    = max_consecutive_loss
         self.cooldown_hours     = cooldown_hours
+        
+        # --- Timeframe definitions ---
+        self.tf_htf1            = mt5.TIMEFRAME_H1
+        self.tf_htf2            = mt5.TIMEFRAME_H4
 
         # ── Optimized Parameters DNA ──
         self.symbol_configs: dict[str, dict] = {}
@@ -252,6 +256,17 @@ class StrategyEngine:
                 time.sleep(10)
 
         mt5.shutdown()
+
+    def _get_bars(self, symbol: str, timeframe: int, count: int) -> pd.DataFrame:
+        """Helper to fetch bars from MT5 and return as a cleaned DataFrame."""
+        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+        if rates is None or len(rates) == 0:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(rates)
+        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+        df.set_index('time', inplace=True)
+        return df
 
     def _process_symbol(self, symbol: str):
         # Fetch OHLC data
