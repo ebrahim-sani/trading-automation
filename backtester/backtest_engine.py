@@ -326,15 +326,30 @@ class BacktestEngine:
             sl_c = closes[:i]
             sl_o = opens[:i]
 
+            # ─── HTF Fractal Context (H4 Zones) ─────────────────────────────
+            # Get H4 bars that were completed BEFORE this M5 bar
+            df_h4_slice = self.df_h4[self.df_h4.index < bar_time]
+            htf_zones = self._get_active_htf_zones(df_h4_slice)
+
+            valid_bullish_htf = False
+            valid_bearish_htf = False
+
+            last_m5_close = float(sl_c[-1])
+            for z in htf_zones:
+                if z['is_bullish'] and z['sl'] <= last_m5_close <= z['entry']:
+                    valid_bullish_htf = True
+                elif not z['is_bullish'] and z['entry'] <= last_m5_close <= z['sl']:
+                    valid_bearish_htf = True
+
             is_bullish = sl_c[-1] > sl_o[-1]
             is_bearish = sl_c[-1] < sl_o[-1]
                 
-            # Create zones (Bullish Candle = Support, Bearish = Resistance)
-            if is_bullish:
+            # Create zones ONLY if they align fractally with the HTF zone
+            if is_bullish and valid_bullish_htf:
                 e, s = float(sl_o[-1]), float(sl_l[-1])
                 if (e - s) > 0:
                     active_zones.append(OHLCZone(e, s, e + (e-s)*self.min_rr, True, 100, {}, i-1))
-            elif is_bearish:
+            elif is_bearish and valid_bearish_htf:
                 e, s = float(sl_o[-1]), float(sl_h[-1])
                 if (s - e) > 0:
                     active_zones.append(OHLCZone(e, s, e - (s-e)*self.min_rr, False, 100, {}, i-1))
@@ -494,6 +509,44 @@ class BacktestEngine:
             return None, trade
 
         return trade, None
+
+    def _get_active_htf_zones(self, df_htf: pd.DataFrame) -> List[dict]:
+        """
+        Scans the HTF dataframe (e.g. H4) to find structural OHLC zones
+        that have not yet been invalidated by a stop-loss breach.
+        """
+        zones = []
+        if len(df_htf) < 2:
+            return zones
+            
+        lookback = min(50, len(df_htf) - 1)
+        
+        # 1. Identify all zones in the lookback window
+        for i in range(len(df_htf) - lookback, len(df_htf)):
+            o = float(df_htf.iloc[i]['open'])
+            h = float(df_htf.iloc[i]['high'])
+            l = float(df_htf.iloc[i]['low'])
+            c = float(df_htf.iloc[i]['close'])
+            
+            if c > o: # Bullish = Support
+                zones.append({'entry': o, 'sl': l, 'is_bullish': True, 'active': True, 'idx': i})
+            elif c < o: # Bearish = Resistance
+                zones.append({'entry': o, 'sl': h, 'is_bullish': False, 'active': True, 'idx': i})
+                
+        # 2. Forward pass to eliminate breached zones
+        for z in zones:
+            for i in range(z['idx'] + 1, len(df_htf)):
+                h = float(df_htf.iloc[i]['high'])
+                l = float(df_htf.iloc[i]['low'])
+                
+                if z['is_bullish'] and l < z['sl']:
+                    z['active'] = False
+                    break
+                elif not z['is_bullish'] and h > z['sl']:
+                    z['active'] = False
+                    break
+                    
+        return [z for z in zones if z['active']]
 
     # ─── Stats ───────────────────────────────────────────────────────────
 

@@ -108,6 +108,10 @@ class StrategyEngine:
         self.max_weekly_loss_usd = max_weekly_loss_usd or risk_usd * 8
         self.max_consec_loss    = max_consecutive_loss
         self.cooldown_hours     = cooldown_hours
+        
+        # --- Timeframe definitions ---
+        self.tf_htf1            = mt5.TIMEFRAME_H1
+        self.tf_htf2            = mt5.TIMEFRAME_H4
 
         # ── Optimized Parameters DNA ──
         self.symbol_configs: dict[str, dict] = {}
@@ -253,12 +257,26 @@ class StrategyEngine:
 
         mt5.shutdown()
 
+    def _get_bars(self, symbol: str, timeframe: int, count: int) -> pd.DataFrame:
+        """Helper to fetch bars from MT5 and return as a cleaned DataFrame."""
+        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+        if rates is None or len(rates) == 0:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(rates)
+        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+        df.set_index('time', inplace=True)
+        return df
+
     def _process_symbol(self, symbol: str):
-        bars = mt5.copy_rates_from_pos(symbol, self.tf_entry, 0, 10)
-        if bars is None or len(bars) < 3:
+        # Fetch OHLC data
+        df_m5 = self._get_bars(symbol, self.tf_entry, 150)
+        df_h4 = self._get_bars(symbol, self.tf_htf2, 150)
+
+        if df_m5.empty or df_h4.empty:
             return
 
-        closed_bar_time = int(bars[-2]["time"])
+        closed_bar_time = int(df_m5.iloc[-2].name.timestamp())
         if self.last_bar_time.get(symbol) == closed_bar_time:
             return
         
@@ -268,15 +286,36 @@ class StrategyEngine:
             return
 
         self.last_bar_time[symbol] = closed_bar_time
-        log.info(f"[{symbol}] Processing candle @ {datetime.fromtimestamp(closed_bar_time, tz=timezone.utc).strftime('%H:%M')} — Checking CMP Zones...")
+        
+        # Ensure we have enough bars
+        if df_m5.empty or df_h4.empty or len(df_m5) < 5 or len(df_h4) < 20:
+            return
 
-        open_c  = float(bars[-2]["open"])
-        high_c  = float(bars[-2]["high"])
-        low_c   = float(bars[-2]["low"])
-        close_c = float(bars[-2]["close"])
+        # Check for M5 retests first (using the latest tick data)
+        self._check_zone_retests(symbol)
 
-        info = mt5.symbol_info(symbol)
+        # ─── HTF Fractal Context (H4 Zones) ─────────────────────────────
+        htf_zones = self._get_active_htf_zones(df_h4)
 
+        # Check if the most recently closed M5 candle closed inside an HTF zone
+        last_closed_bar = df_m5.iloc[-2]
+        open_c  = float(last_closed_bar['open'])
+        high_c  = float(last_closed_bar['high'])
+        low_c   = float(last_closed_bar['low'])
+        close_c = float(last_closed_bar['close'])
+
+        valid_bullish_htf = False
+        valid_bearish_htf = False
+
+        for z in htf_zones:
+            # Support zone check: Is the M5 close inside the H4 Open-to-Low space?
+            if z['is_bullish'] and z['sl'] <= close_c <= z['entry']:
+                valid_bullish_htf = True
+            # Resistance zone check: Is the M5 close inside the H4 Open-to-High space?
+            elif not z['is_bullish'] and z['entry'] <= close_c <= z['sl']:
+                valid_bearish_htf = True
+
+        # ─── LTF Zone Creation (M5) ─────────────────────────────────────
         # CMP Logic: Support = Bullish Candle, Resistance = Bearish Candle
         is_bullish = close_c > open_c
         is_bearish = close_c < open_c
@@ -299,9 +338,9 @@ class StrategyEngine:
                     "is_bullish": True, "score": 100, "factors": {},
                     "active": True, "creation_time": datetime.now(timezone.utc)
                 }
-                self._log_and_alert_zone(symbol, new_zone, "🟢 *SUPPORT ZONE IDENTIFIED*")
+                self._log_and_alert_zone(symbol, new_zone, "🟢 *LTF SUPPORT ZONE IDENTIFIED (HTF ALIGNED)*")
                 
-        elif is_bearish:
+        elif is_bearish and valid_bearish_htf:
             # Resistance = Bearish Candle (Open to High)
             entry = open_c
             sl    = high_c
@@ -312,7 +351,42 @@ class StrategyEngine:
                     "is_bullish": False, "score": 100, "factors": {},
                     "active": True, "creation_time": datetime.now(timezone.utc)
                 }
-                self._log_and_alert_zone(symbol, new_zone, "🔴 *RESISTANCE ZONE IDENTIFIED*")
+                self._log_and_alert_zone(symbol, new_zone, "🔴 *LTF RESISTANCE ZONE IDENTIFIED (HTF ALIGNED)*")
+
+    def _get_active_htf_zones(self, df_htf: pd.DataFrame) -> List[dict]:
+        """
+        Scans the HTF dataframe (e.g. H4) to find structural OHLC zones
+        that have not yet been invalidated by a stop-loss breach.
+        """
+        zones = []
+        lookback = min(50, len(df_htf) - 1)
+        
+        # 1. Identify all zones in the lookback window
+        for i in range(len(df_htf) - lookback, len(df_htf) - 1):
+            o = float(df_htf.iloc[i]['open'])
+            h = float(df_htf.iloc[i]['high'])
+            l = float(df_htf.iloc[i]['low'])
+            c = float(df_htf.iloc[i]['close'])
+            
+            if c > o: # Bullish = Support
+                zones.append({'entry': o, 'sl': l, 'is_bullish': True, 'active': True, 'idx': i})
+            elif c < o: # Bearish = Resistance
+                zones.append({'entry': o, 'sl': h, 'is_bullish': False, 'active': True, 'idx': i})
+                
+        # 2. Forward pass to eliminate breached zones
+        for z in zones:
+            for i in range(z['idx'] + 1, len(df_htf)):
+                h = float(df_htf.iloc[i]['high'])
+                l = float(df_htf.iloc[i]['low'])
+                
+                if z['is_bullish'] and l < z['sl']:
+                    z['active'] = False
+                    break
+                elif not z['is_bullish'] and h > z['sl']:
+                    z['active'] = False
+                    break
+                    
+        return [z for z in zones if z['active']]
 
         if new_zone:
             if symbol not in self.active_zones: self.active_zones[symbol] = []
@@ -366,17 +440,7 @@ class StrategyEngine:
                 zone["active"] = False # One entry per zone
 
     def _log_and_alert_zone(self, symbol, zone, status):
-        """Sends a Telegram alert when a clean OHLC zone is identified."""
-        msg = (
-            f"{status} | #{symbol}\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"🎯 *Wait Price:* `{zone['entry']:.5f}`\n"
-            f"🛡️ *Stop Loss:* `{zone['sl']:.5f}`\n"
-            f"📊 *Candle Score:* `{zone['score']}/100`\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"_Awaiting price retest for execution..._"
-        )
-        send_telegram_alert(msg)
+        """Logs when a clean OHLC zone is identified (no Telegram alert)."""
         log.info(f"[{symbol}] New Zone: {status} at {zone['entry']}")
 
 
