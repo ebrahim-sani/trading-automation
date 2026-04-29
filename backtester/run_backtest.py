@@ -91,21 +91,26 @@ def backtest_symbol(
 ) -> BacktestResult | None:
 
     log.info(f"\n{'─'*60}")
-    log.info(f"  Backtesting [CMP Strategy]: {symbol}  |  {days} days  |  min_rr={min_rr}")
+    log.info(f"  Backtesting [CMP v8.0]: {symbol}  |  {days} days  |  min_rr={min_rr}")
     log.info(f"{'─'*60}")
 
     df_m5 = fetch_bars(symbol, mt5.TIMEFRAME_M5, days)
-    df_h1 = fetch_bars(symbol, mt5.TIMEFRAME_H1, days + 30)  # extra for EMA warm-up
+    df_h1 = fetch_bars(symbol, mt5.TIMEFRAME_H1, days + 30)   # extra for EMA warm-up
     df_h4 = fetch_bars(symbol, mt5.TIMEFRAME_H4, days + 60)
+    df_d1 = fetch_bars(symbol, mt5.TIMEFRAME_D1, days + 250)  # Fix 1: D1 data (250 extra for EMA200)
 
     if df_m5.empty or df_h1.empty or df_h4.empty:
         log.error(f"  Skipping {symbol} — insufficient data")
         return None
 
+    if df_d1.empty:
+        log.warning(f"  {symbol}: No D1 data — D1 trend filter disabled for this symbol")
+
     engine = BacktestEngine(
         df_m5=df_m5,
         df_h1=df_h1,
         df_h4=df_h4,
+        df_d1=df_d1,
         symbol=symbol,
         min_score=min_score,
         min_rr=min_rr,

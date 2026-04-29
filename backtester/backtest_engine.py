@@ -1,16 +1,16 @@
 """
-TTFM Backtesting Engine v1.0
+TTFM Backtesting Engine v2.1
 ─────────────────────────────────────────────────────────────────────────────
-Replays the StrategyEngine scoring logic bar-by-bar over historical MT5 data
-without placing any real trades. Computes trades, PnL, win rate, and RR stats.
+Mirrors the live engine.py [v8.1] CMP strategy with surgical execution fixes:
 
-Key design decisions:
-  - Mirror _score_factors() logic 1-to-1 from strategy/engine.py
-  - HTF bias is computed inline using the same bars slice (no extra MT5 call)
-  - Spread penalty uses a rolling mean of the 'spread' column (if available)
-  - Kronos / Vibe scores default to 0 (cannot be reliably replayed historically)
-  - Trades are closed at TP or SL using future OHLC (forward simulation)
-  - All timestamps are UTC-aware
+  Fix A — H4 Displacement Filter   (body ≥ 40% of range — was 60%)
+  Fix B — H4 Zone Freshness        (last 30 H4 candles = ~5 days — was 12)
+  Fix C — Momentum Extreme Breaker (skip entry if 6 consecutive M5 bars
+                                    all one direction AND move > 2×ATR14)
+  Fix D — Bar-Close Confirmation   (entry on sweep + close confirmation)
+
+  Note: Fix E (per-asset rate limit) is live-trading only; it is not
+  applied in backtest so we can measure raw strategy signal quality.
 """
 
 from __future__ import annotations
@@ -234,15 +234,19 @@ class BacktestEngine:
         Whether to enable Kronos/Vibe AI scoring.
     """
 
-    # CMP Strategy: No composite scoring. Zones are created from OHLC candle structure.
-    # Quality filter: only create a zone if the candle body >= MIN_BODY_RATIO of total range.
-    MIN_BODY_RATIO = 0.20  # At least 20% body to avoid doji noise
+    # ── Strategy constants (mirrors engine.py v8.1) ──────────────────────
+    MIN_BODY_RATIO    = 0.20   # M5 zone-forming candle min body ratio
+    H4_MIN_BODY_RATIO = 0.40   # Fix A: H4 candle must have ≥40% body-to-range
+    H4_ZONE_LOOKBACK  = 30     # Fix B: last 30 H4 candles (~5 days)
+    MOMENTUM_BARS     = 6      # Fix C: consecutive M5 bars for extreme check
+    MOMENTUM_ATR_MULT = 2.0    # Fix C: move must exceed this × ATR14 to block
 
     def __init__(
         self,
         df_m5:          pd.DataFrame,
         df_h1:          pd.DataFrame,
         df_h4:          pd.DataFrame,
+        df_d1:          pd.DataFrame = None,   # accepted but not used (D1 gate removed in v8.1)
         symbol:         str   = "SYMBOL",
         left_bars:      int   = 8,
         right_bars:     int   = 8,
@@ -252,26 +256,25 @@ class BacktestEngine:
         session_start:  float = 7.5,
         session_end:    float = 19.0,
         max_pivot_bars: int   = 120,
-        max_future_bars: int  = 96,    # ~8 hrs on M5
+        max_future_bars: int  = 96,
         spread_pts:     float = 0.0002,
         use_ai:         bool  = False,
     ):
-        self.df       = df_m5.copy()
-        self.df_h1    = df_h1.copy()
-        self.df_h4    = df_h4.copy()
-        self.symbol   = symbol
-        self.left     = left_bars
-        self.right    = right_bars
-        self.min_rr   = min_rr
-        self.risk_usd  = risk_usd
-        self.session_start = session_start
-        self.session_end   = session_end
-        self.max_pivot_bars = max_pivot_bars
+        self.df      = df_m5.copy()
+        self.df_h1   = df_h1.copy()
+        self.df_h4   = df_h4.copy()
+        self.symbol  = symbol
+        self.left    = left_bars
+        self.right   = right_bars
+        self.min_rr  = min_rr
+        self.risk_usd        = risk_usd
+        self.session_start   = session_start
+        self.session_end     = session_end
+        self.max_pivot_bars  = max_pivot_bars
         self.max_future_bars = max_future_bars
-        self.spread_pts = spread_pts
-        self.use_ai = use_ai
-
-        self.min_score = min_score
+        self.spread_pts      = spread_pts
+        self.use_ai          = use_ai
+        self.min_score       = min_score
 
         # Ensure UTC index
         if self.df.index.tzinfo is None:
@@ -328,71 +331,79 @@ class BacktestEngine:
             sl_c = closes[:i]
             sl_o = opens[:i]
 
-            # ─── HTF Fractal Context (H4 Zones) ─────────────────────────────
-            # Get H4 bars that were completed BEFORE this M5 bar
+            # ─── HTF Fractal Context (H4 Zones) ─────────────────────────
             df_h4_slice = self.df_h4[self.df_h4.index < bar_time]
-            htf_zones = self._get_active_htf_zones(df_h4_slice)
-
-            valid_bullish_htf = False
-            valid_bearish_htf = False
+            htf_zones   = self._get_active_htf_zones(df_h4_slice)
 
             last_m5_close = float(sl_c[-1])
-            for z in htf_zones:
-                if z['is_bullish'] and z['sl'] <= last_m5_close <= z['entry']:
-                    valid_bullish_htf = True
-                elif not z['is_bullish'] and z['entry'] <= last_m5_close <= z['sl']:
-                    valid_bearish_htf = True
+            valid_bullish_htf = any(
+                z["sl"] <= last_m5_close <= z["entry"] for z in htf_zones if z["is_bullish"]
+            )
+            valid_bearish_htf = any(
+                z["entry"] <= last_m5_close <= z["sl"] for z in htf_zones if not z["is_bullish"]
+            )
 
             is_bullish = sl_c[-1] > sl_o[-1]
             is_bearish = sl_c[-1] < sl_o[-1]
 
-            # Quality filter: skip doji / indecision candles
             last_o = float(sl_o[-1])
             last_c = float(sl_c[-1])
             last_h = float(sl_h[-1])
             last_l = float(sl_l[-1])
             candle_range = last_h - last_l
-            body = abs(last_c - last_o)
-            body_ratio = body / candle_range if candle_range > 0 else 0
+            body         = abs(last_c - last_o)
+            body_ratio   = body / candle_range if candle_range > 0 else 0
 
             if body_ratio < self.MIN_BODY_RATIO:
                 pass  # Doji — skip zone creation
             elif is_bullish and valid_bullish_htf:
-                e, s = last_o, last_l
+                e = last_o   # M5 open = entry trigger
+                s = last_l   # M5 candle low = tight SL
                 if (e - s) > 0:
-                    active_zones.append(OHLCZone(e, s, e + (e-s)*self.min_rr, True, 100, {}, i-1))
+                    active_zones.append(OHLCZone(e, s, e + (e - s) * self.min_rr, True,  100, {}, i - 1))
             elif is_bearish and valid_bearish_htf:
-                e, s = last_o, last_h
+                e = last_o   # M5 open = entry trigger
+                s = last_h   # M5 candle high = tight SL
                 if (s - e) > 0:
-                    active_zones.append(OHLCZone(e, s, e - (s-e)*self.min_rr, False, 100, {}, i-1))
+                    active_zones.append(OHLCZone(e, s, e - (s - e) * self.min_rr, False, 100, {}, i - 1))
 
             if len(active_zones) > MAX_ZONES:
                 active_zones.pop(0)
 
-            # ── 3. Check for Retest Entry at Current Bar i ───────────
-            # Deactivate zones if price breaches SL before entry
+            # ── 3. Check for Retest Entry at Current Bar i ───────────────
+            # Deactivate zones whose SL was breached by this bar
             for z in active_zones:
                 if z.active:
                     if (z.is_bullish and lows[i] < z.sl) or (not z.is_bullish and highs[i] > z.sl):
                         z.active = False
-            
+
             # Session filter
             decimal_hour = bar_time.hour + bar_time.minute / 60.0
-            in_session = ("BTC" in self.symbol or "ETH" in self.symbol) or (self.session_start <= decimal_hour < self.session_end)
-            
+            in_session   = ("BTC" in self.symbol or "ETH" in self.symbol) or \
+                           (self.session_start <= decimal_hour < self.session_end)
+
             if open_trade is None and in_session:
                 for z in active_zones:
                     if not z.active:
                         continue
-                    # Entry trigger: price reaches the Open price level
-                    if (z.is_bullish and lows[i] <= z.entry) or (not z.is_bullish and highs[i] >= z.entry):
+                    # Fix D: Bar-close confirmation — sweep + rejection required
+                    bull_confirmed = z.is_bullish  and lows[i]  <= z.entry and closes[i] > z.entry
+                    bear_confirmed = not z.is_bullish and highs[i] >= z.entry and closes[i] < z.entry
+                    if bull_confirmed or bear_confirmed:
+                        direction = "buy" if z.is_bullish else "sell"
+                        # Fix C: Momentum extreme breaker
+                        if self._is_momentum_extreme(highs, lows, closes, opens, i, direction):
+                            continue
                         open_trade = Trade(
-                            symbol=self.symbol, direction="buy" if z.is_bullish else "sell",
-                            entry_time=bar_time, entry=z.entry, sl=z.sl, tp=z.tp, 
-                            rr=self.min_rr, score=z.score, factors=z.factors, entry_bar_idx=i
+                            symbol=self.symbol,
+                            direction=direction,
+                            entry_time=bar_time, entry=z.entry,
+                            sl=z.sl, tp=z.tp,
+                            rr=self.min_rr, score=z.score,
+                            factors=z.factors, entry_bar_idx=i,
                         )
-                        z.active = False # Deactivate after entry
-                        break 
+                        z.active = False
+                        break
 
         # Close any still-open trade at end-of-data
         if open_trade is not None:
@@ -544,10 +555,59 @@ class BacktestEngine:
 
         return trade, None
 
+    def _is_momentum_extreme(
+        self,
+        highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, opens: np.ndarray,
+        bar_idx: int, direction: str
+    ) -> bool:
+        """
+        Fix C: Returns True if the last MOMENTUM_BARS closed bars before bar_idx
+        are ALL one-directional AND total range > MOMENTUM_ATR_MULT × ATR14.
+
+        direction='buy'  → checks for bearish crash (we'd be buying into it)
+        direction='sell' → checks for bullish spike (we'd be selling into it)
+        """
+        needed = bar_idx - (self.MOMENTUM_BARS + 2)
+        if needed < 20:
+            return False
+
+        start = bar_idx - self.MOMENTUM_BARS - 2
+        end   = bar_idx - 2
+
+        seg_c = closes[start:end]
+        seg_o = opens[start:end]
+
+        if direction == "buy":
+            all_directional = all(seg_c[j] < seg_o[j] for j in range(len(seg_c)))
+        else:
+            all_directional = all(seg_c[j] > seg_o[j] for j in range(len(seg_c)))
+
+        if not all_directional:
+            return False
+
+        atr_start = bar_idx - 20
+        atr_h = highs[atr_start:bar_idx - 2]
+        atr_l = lows[atr_start:bar_idx - 2]
+        atr_c = closes[atr_start:bar_idx - 2]
+        tr_list = [
+            max(atr_h[j] - atr_l[j], abs(atr_h[j] - atr_c[j-1]), abs(atr_l[j] - atr_c[j-1]))
+            for j in range(1, len(atr_h))
+        ]
+        if len(tr_list) < 14:
+            return False
+        atr14 = sum(tr_list[-14:]) / 14
+
+        seg_h = highs[start:end]
+        seg_l = lows[start:end]
+        total_move = float(seg_h.max() - seg_l.min())
+        return total_move > (self.MOMENTUM_ATR_MULT * atr14)
+
     def _get_active_htf_zones(self, df_htf: pd.DataFrame) -> List[dict]:
         """
-        Scans the HTF dataframe (H4) to find structural OHLC zones
-        that have not been invalidated by a stop-loss breach.
+        Scans H4 bars for structural OHLC zones that are:
+          - Recent      (last H4_ZONE_LOOKBACK = 30 candles, ~5 days on H4)
+          - Displacement(body ≥ H4_MIN_BODY_RATIO = 40% of candle range)
+          - Not yet invalidated by SL breach in subsequent bars
         Only reads CONFIRMED closed bars (excludes the last/current open bar).
         """
         zones = []
@@ -555,36 +615,39 @@ class BacktestEngine:
         if n < 2:
             return zones
 
-        # Only scan confirmed closed bars — stop at n-1 to exclude the live bar
         confirmed = n - 1
-        lookback = min(50, confirmed)
-        start = confirmed - lookback
+        lookback  = min(self.H4_ZONE_LOOKBACK, confirmed)
+        start     = confirmed - lookback
 
-        # 1. Build zone list from confirmed bars only
         for pos in range(start, confirmed):
-            o = float(df_htf.iloc[pos]['open'])
-            h = float(df_htf.iloc[pos]['high'])
-            l = float(df_htf.iloc[pos]['low'])
-            c = float(df_htf.iloc[pos]['close'])
+            o = float(df_htf.iloc[pos]["open"])
+            h = float(df_htf.iloc[pos]["high"])
+            l = float(df_htf.iloc[pos]["low"])
+            c = float(df_htf.iloc[pos]["close"])
 
-            if c > o:   # Bullish candle → Support zone (Open to Low)
-                zones.append({'entry': o, 'sl': l, 'is_bullish': True,  'active': True, 'pos': pos})
-            elif c < o: # Bearish candle → Resistance zone (Open to High)
-                zones.append({'entry': o, 'sl': h, 'is_bullish': False, 'active': True, 'pos': pos})
+            candle_range = h - l
+            body         = abs(c - o)
+            if candle_range <= 0 or (body / candle_range) < self.H4_MIN_BODY_RATIO:
+                continue
 
-        # 2. Forward pass — deactivate zones breached by later confirmed bars
+            if c > o:    # Bullish displacement → support zone (Open to Low)
+                zones.append({"entry": o, "sl": l, "is_bullish": True,  "active": True, "pos": pos})
+            elif c < o:  # Bearish displacement → resistance zone (Open to High)
+                zones.append({"entry": o, "sl": h, "is_bullish": False, "active": True, "pos": pos})
+
+        # 2. Forward pass — deactivate zones whose SL was breached by later bars
         for z in zones:
-            for pos in range(z['pos'] + 1, confirmed):
-                h = float(df_htf.iloc[pos]['high'])
-                l = float(df_htf.iloc[pos]['low'])
-                if z['is_bullish'] and l < z['sl']:
-                    z['active'] = False
+            for pos in range(z["pos"] + 1, confirmed):
+                h = float(df_htf.iloc[pos]["high"])
+                l = float(df_htf.iloc[pos]["low"])
+                if z["is_bullish"] and l < z["sl"]:
+                    z["active"] = False
                     break
-                elif not z['is_bullish'] and h > z['sl']:
-                    z['active'] = False
+                elif not z["is_bullish"] and h > z["sl"]:
+                    z["active"] = False
                     break
 
-        return [z for z in zones if z['active']]
+        return [z for z in zones if z["active"]]
 
     # ─── Stats ───────────────────────────────────────────────────────────
 

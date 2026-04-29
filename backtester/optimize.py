@@ -34,8 +34,8 @@ def objective(trial, symbol, days):
         min_score=min_score,
         min_rr=min_rr,
         risk_usd=10,
-        session_start=3.0,
-        session_end=20.0,
+        session_start=7.5,
+        session_end=22.0,
         use_ai=False
     )
     
