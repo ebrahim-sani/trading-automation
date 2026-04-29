@@ -77,6 +77,24 @@ class MT5Executor:
         price      = tick.ask            if action == "buy"  else tick.bid
         filling    = self._get_filling(symbol)
 
+        # ── Margin Pre-Check (Guard 2) ────────────────────────────────
+        # Prevents 10019 "No money" broker rejections by checking locally first.
+        account    = mt5.account_info()
+        margin_req = mt5.order_calc_margin(order_type, symbol, lots, price)
+        if account is None or margin_req is None:
+            log.error(f"Cannot get account/margin info for {symbol} — skipping")
+            return
+        log.info(
+            f"  Margin check | {symbol} {action} {lots}L | "
+            f"Need: ${margin_req:.2f} | Free: ${account.margin_free:.2f}"
+        )
+        if margin_req > account.margin_free * 0.90:
+            log.warning(
+                f"  → Rejected: insufficient margin | {symbol} | "
+                f"Need ${margin_req:.2f} but only ${account.margin_free:.2f} free"
+            )
+            return
+
         request = {
             "action":       mt5.TRADE_ACTION_DEAL,
             "symbol":       symbol,

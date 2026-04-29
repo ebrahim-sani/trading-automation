@@ -31,7 +31,7 @@ def calculate_lots(entry: float, sl: float, risk_usd: float, symbol: str) -> flo
     lots = round(raw_lots / step) * step
     lots = max(info.volume_min, min(info.volume_max, lots))
 
-    log.debug(
+    log.info(
         f"{symbol} | Risk ${risk_usd} | Delta: {price_delta:.5f} | "
         f"Val/unit: {value_per_unit:.4f} | Raw: {raw_lots:.4f} | Final: {lots}"
     )
