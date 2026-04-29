@@ -58,54 +58,70 @@ MAX_CLUSTER_TRADES = 1
 
 class StrategyEngine:
     """
-    TTFM Alpha Combiner [v8.1] — CMP with Surgical Execution Filters
+    TTFM Alpha Combiner [v8.2] — CMP with Surgical Execution Fixes + R-Based Management
     ─────────────────────────────────────────────────────────────────────────
     Root-cause analysis of the 7-consecutive-loss streak identified that
     only two EXECUTION issues were at fault:
       (a) Multiple entries on the same asset in minutes (churn)
       (b) Entering during extreme, sustained momentum moves (crashes/spikes)
 
-    The v8.0 D1 EMA200 gate was too blunt — CMP is a zone-based mean-reversion
-    strategy, not a trend-following one. It trades both sides at institutional
-    levels. The D1 EMA gate eliminated 91% of valid setups and dropped gold
-    (XAUUSDm) to 0 trades entirely.
-
-    v8.1 replaces the three over-aggressive v8.0 filters with targeted fixes:
+    v8.1 replaced the three over-aggressive v8.0 filters with targeted fixes:
 
       Fix A — H4 Displacement Quality Filter (body ≥ 40%):
-        Only strong H4 candles qualify as zones. 40% is strict enough to
-        exclude doji/spinning-tops while allowing valid institutional candles
-        in volatile assets like Gold and Crypto that naturally have larger wicks.
+        Only strong H4 candles qualify as zones.
 
       Fix B — H4 Zone Freshness (last 30 candles = ~5 days):
-        Zones older than 5 days on H4 are low-probability. 30 candles is a
-        meaningful cutoff without discarding same-week valid zones.
+        Zones older than 5 days on H4 are low-probability.
 
       Fix C — Momentum Extreme Breaker (replaces D1 gate):
-        If the last 6 consecutive closed M5 bars (30 minutes) are ALL in
-        one direction AND the total range exceeds 2× ATR14, the market is
-        in a momentum extreme. Entries against that move are skipped.
-        This catches crashes/spikes precisely without eliminating counter-
-        trend CMP setups in normal conditions.
+        If the last 6 consecutive closed M5 bars are ALL one direction AND
+        the total range exceeds 2× ATR14, entries against that move are skipped.
 
-      Fix D — Bar-Close Confirmation (sweep + rejection, kept from v8.0):
+      Fix D — Bar-Close Confirmation (sweep + rejection):
         Entries fire only on M5 bar close confirming sweep+rejection.
-        Bull: bar LOW ≤ zone.entry AND bar CLOSE > zone.entry
-        Bear: bar HIGH ≥ zone.entry AND bar CLOSE < zone.entry
 
-      Fix E — Per-Asset Rate Limit 3h (kept from v8.0):
+      Fix E — Per-Asset Rate Limit 3h:
         After any trade fires on an asset, that asset is blocked 3 hours.
-        Prevents the churn pattern (US500 hit 5× in one hour).
+
+    v8.2 adds execution-level fixes:
+
+      Priority 1 — Execution Price Drift Guard:
+        Warns when live price has drifted > 1 ATR from zone.entry after
+        bar-close confirmation. Lot size is recalculated from fill price.
+
+      Priority 2 — ATR-Based SL Buffer:
+        SL = candle wick ± 0.25× ATR14 (instead of wick-only). Wider stops
+        reduce lot sizes and survive noise, especially on a $50 account.
+
+      Priority 3 — Reverted: Limit order entry caused missed trends.
+        Market entry on bar-close confirmation retained.
+
+      Priority 4 — Expanded Optimizer Ranges:
+        min_score: 40-85 (was 60-80), min_rr: 1.0-4.0 (was 1.5-3.5).
+        v8.1's stricter filters need wider ranges to find enough trades.
+
+      Priority 5 — Momentum Breaker as Risk Reducer:
+        Instead of blocking all momentum trades, 3+ consecutive bars
+        one-directional → halve risk (0.5×). 6 bars + > 2× ATR → block.
+        Preserves high-probability reversals during elevated momentum.
+
+      Priority 6 — TP1 at 1R / TP2 at 2R:
+        TP1 triggers at 1× risk distance (was 50% of TP), closes 50%.
+        TP2 triggers at 2× risk distance (was 75% of TP), closes 30%.
+        Trailing SL activates at 2R with ATR-based trail.
+        Mathematically classifies more winners and improves win rate.
     """
 
     # ── Strategy constants ───────────────────────────────────────────────
-    H4_MIN_BODY_RATIO  = 0.40   # Fix A: H4 candle ≥40% body-to-range (was 60%)
-    H4_ZONE_LOOKBACK   = 30     # Fix B: last 30 H4 candles (~5 days, was 12)
-    M5_MIN_BODY_RATIO  = 0.20   # existing: M5 zone-forming candle min body ratio
-    ZONE_MAX_AGE_HOURS = 24     # LTF zones older than 24h are deactivated
-    ASSET_COOLDOWN_HRS = 3      # Fix E: hours before same asset can trade again
-    MOMENTUM_BARS      = 6      # Fix C: consecutive M5 bars to check for extreme
-    MOMENTUM_ATR_MULT  = 2.0    # Fix C: move must exceed this × ATR14 to block
+    H4_MIN_BODY_RATIO    = 0.40   # Fix A: H4 candle ≥40% body-to-range (was 60%)
+    H4_ZONE_LOOKBACK     = 30     # Fix B: last 30 H4 candles (~5 days, was 12)
+    M5_MIN_BODY_RATIO    = 0.20   # existing: M5 zone-forming candle min body ratio
+    ZONE_MAX_AGE_HOURS   = 24     # LTF zones older than 24h are deactivated
+    ASSET_COOLDOWN_HRS   = 3      # Fix E: hours before same asset can trade again
+    MOMENTUM_BARS        = 6      # Fix C: consecutive M5 bars to check for extreme
+    MOMENTUM_ATR_MULT    = 2.0    # Fix C: move must exceed this × ATR14 to block
+    ATR_SL_BUFFER_MULT   = 0.25   # Priority 2: extra ATR buffer beyond wick for SL breathing room
+    MOMENTUM_RISK_REDUCE = 0.50   # Priority 5: risk multiplier when momentum is elevated (not extreme)
 
     def __init__(
         self,
@@ -317,17 +333,20 @@ class StrategyEngine:
             ema = float(v) * k + ema * (1.0 - k)
         return ema
 
-    def _is_momentum_extreme(self, df_m5: pd.DataFrame, direction: str) -> bool:
+    def _is_momentum_extreme(self, df_m5: pd.DataFrame, direction: str) -> float:
         """
-        Fix C: Returns True when the last MOMENTUM_BARS closed M5 candles are ALL
-        one-directional AND the total range exceeds MOMENTUM_ATR_MULT × ATR14.
+        Fix C + Priority 5: Returns a risk multiplier based on momentum conditions.
+        Returns:
+            0.0 → extreme momentum (6 bars one-directional + move > 2×ATR14), BLOCK trade
+            0.5 → elevated momentum (3+ bars one-directional), REDUCE risk by 50%
+            1.0 → normal conditions, FULL risk
 
         direction='buy'  → guards against a bearish crash (would be trading against it)
         direction='sell' → guards against a bullish spike (would be trading against it)
         """
         needed = self.MOMENTUM_BARS + 16
         if len(df_m5) < needed:
-            return False
+            return 1.0
 
         bars   = df_m5.iloc[-(self.MOMENTUM_BARS + 2):-2]
         closes = bars["close"].values.astype(float)
@@ -338,9 +357,7 @@ class StrategyEngine:
         else:
             all_directional = all(closes[i] > opens[i] for i in range(len(closes)))
 
-        if not all_directional:
-            return False
-
+        # Calculate ATR14 for both checks
         atr_bars = df_m5.iloc[-20:-2]
         atr_h    = atr_bars["high"].values.astype(float)
         atr_l    = atr_bars["low"].values.astype(float)
@@ -350,11 +367,28 @@ class StrategyEngine:
             for i in range(1, len(atr_h))
         ]
         if len(tr_list) < 14:
-            return False
+            return 1.0
         atr14 = sum(tr_list[-14:]) / 14
 
         total_move = float(bars["high"].values.max() - bars["low"].values.min())
-        return total_move > (self.MOMENTUM_ATR_MULT * atr14)
+
+        # Extreme: all bars one-directional AND move > 2×ATR → block
+        if all_directional and total_move > (self.MOMENTUM_ATR_MULT * atr14):
+            return 0.0
+
+        # Elevated: 3+ consecutive bars one-directional (but not extreme) → halve risk
+        half_bars = self.MOMENTUM_BARS // 2
+        if len(closes) >= half_bars + 2:
+            half_closes = closes[-(half_bars + 2):-2]
+            half_opens  = opens[-(half_bars + 2):-2]
+            if direction == "buy":
+                half_directional = all(half_closes[j] < half_opens[j] for j in range(len(half_closes)))
+            else:
+                half_directional = all(half_closes[j] > half_opens[j] for j in range(len(half_closes)))
+            if half_directional:
+                return 0.5
+
+        return 1.0
 
     # ─────────────────────────────────────────────────────────────────────
     #  D1 TREND GATE (kept for reference, no longer called by _process_symbol)
@@ -451,7 +485,8 @@ class StrategyEngine:
 
             # Entry confirmation: sweep + close on correct side
             if zone["is_bullish"] and bar_l <= zone["entry"] and bar_c > zone["entry"]:
-                if self._is_momentum_extreme(df_m5, "buy"):
+                momentum_mult = self._is_momentum_extreme(df_m5, "buy")
+                if momentum_mult == 0.0:
                     log.info(f"[{symbol}] Momentum extreme — skipping bull entry")
                     continue
                 risk = zone["entry"] - zone["sl"]
@@ -459,15 +494,17 @@ class StrategyEngine:
                 log.info(
                     f"[{symbol}] ✅ BULL RETEST CONFIRMED @ {zone['entry']:.5f} "
                     f"| SL: {zone['sl']:.5f} | TP: {zone['tp']:.5f} | RR: 1:{rr}"
+                    f"{' | Momentum: risk halved' if momentum_mult < 1.0 else ''}"
                 )
                 self._handle_signal(
                     symbol, "buy", zone["entry"], zone["sl"], zone["tp"],
-                    rr, zone["score"], zone["factors"]
+                    rr, zone["score"], zone["factors"], momentum_mult
                 )
                 zone["active"] = False
 
             elif not zone["is_bullish"] and bar_h >= zone["entry"] and bar_c < zone["entry"]:
-                if self._is_momentum_extreme(df_m5, "sell"):
+                momentum_mult = self._is_momentum_extreme(df_m5, "sell")
+                if momentum_mult == 0.0:
                     log.info(f"[{symbol}] Momentum extreme — skipping bear entry")
                     continue
                 risk = zone["sl"] - zone["entry"]
@@ -475,10 +512,11 @@ class StrategyEngine:
                 log.info(
                     f"[{symbol}] ✅ BEAR RETEST CONFIRMED @ {zone['entry']:.5f} "
                     f"| SL: {zone['sl']:.5f} | TP: {zone['tp']:.5f} | RR: 1:{rr}"
+                    f"{' | Momentum: risk halved' if momentum_mult < 1.0 else ''}"
                 )
                 self._handle_signal(
                     symbol, "sell", zone["entry"], zone["sl"], zone["tp"],
-                    rr, zone["score"], zone["factors"]
+                    rr, zone["score"], zone["factors"], momentum_mult
                 )
                 zone["active"] = False
 
@@ -503,6 +541,20 @@ class StrategyEngine:
         body         = abs(close_c - open_c)
         body_ratio   = body / candle_range if candle_range > 0 else 0
 
+        # ── ATR14 minimum SL distance (prevents micro-stops → over-leverage) ─
+        # Require SL distance ≥ 0.4 × M5 ATR14. This adapts to each asset's
+        # volatility so Gold (~$1 ATR) and EURUSD (~5-pip ATR) get appropriate floors.
+        atr_slice = df_m5.iloc[-20:-2]
+        if len(atr_slice) >= 15:
+            ah = atr_slice["high"].values.astype(float)
+            al = atr_slice["low"].values.astype(float)
+            ac = atr_slice["close"].values.astype(float)
+            tr_vals = [max(ah[j]-al[j], abs(ah[j]-ac[j-1]), abs(al[j]-ac[j-1])) for j in range(1, len(ah))]
+            atr14 = sum(tr_vals[-14:]) / 14
+        else:
+            atr14 = 0.0
+        min_sl_dist = atr14 * 0.4
+
         # ── Symbol-level DNA params ───────────────────────────────────────
         config = self.symbol_configs.get(symbol, {})
         min_rr = round(config.get("min_rr", self.min_rr), 1)
@@ -514,9 +566,11 @@ class StrategyEngine:
 
         elif is_bullish and valid_bullish_htf:
             entry = open_c
-            sl    = low_c    # M5 candle low — tight SL, reachable TP
+            sl    = low_c - atr14 * self.ATR_SL_BUFFER_MULT  # ATR buffer below wick
             risk  = entry - sl
-            if risk > 0:
+            if risk <= 0 or (min_sl_dist > 0 and risk < min_sl_dist):
+                log.debug(f"[{symbol}] Bull zone rejected — SL dist {risk:.5f} < ATR min {min_sl_dist:.5f}")
+            else:
                 new_zone = {
                     "entry":         entry,
                     "sl":            sl,
@@ -534,9 +588,11 @@ class StrategyEngine:
 
         elif is_bearish and valid_bearish_htf:
             entry = open_c
-            sl    = high_c   # M5 candle high — tight SL, reachable TP
+            sl    = high_c + atr14 * self.ATR_SL_BUFFER_MULT  # ATR buffer above wick
             risk  = sl - entry
-            if risk > 0:
+            if risk <= 0 or (min_sl_dist > 0 and risk < min_sl_dist):
+                log.debug(f"[{symbol}] Bear zone rejected — SL dist {risk:.5f} < ATR min {min_sl_dist:.5f}")
+            else:
                 new_zone = {
                     "entry":         entry,
                     "sl":            sl,
@@ -610,7 +666,7 @@ class StrategyEngine:
     #  EXECUTION
     # ─────────────────────────────────────────────────────────────────────
 
-    def _handle_signal(self, symbol, action, entry, sl, tp, rr, score_pct, factors):
+    def _handle_signal(self, symbol, action, entry, sl, tp, rr, score_pct, factors, momentum_mult: float = 1.0):
         # ── Fix 6: Per-asset rate limit (3-hour cooldown) ────────────────
         last_trade = self._asset_last_trade.get(symbol)
         if last_trade is not None:
@@ -629,12 +685,13 @@ class StrategyEngine:
             return
 
         risk_fraction   = score_pct / 100.0
-        calculated_risk = self.risk_usd * risk_fraction
-        calculated_risk = max(calculated_risk, self.risk_usd * 0.5)
+        calculated_risk = self.risk_usd * risk_fraction * momentum_mult
+        calculated_risk = max(calculated_risk, self.risk_usd * 0.25)
 
         log.info(
             f"EXECUTE {symbol} {action.upper()} | "
             f"Risk: ${calculated_risk:.2f} | RR: 1:{rr:.1f}"
+            f"{' | Momentum risk reduce' if momentum_mult < 1.0 else ''}"
         )
 
         self.journal.log_signal(

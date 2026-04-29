@@ -20,9 +20,11 @@ log = logging.getLogger("Optimizer")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 def objective(trial, symbol, days):
-    # Suggest parameters - Floor 60 for Gold safety, Ceiling 80 for Action
-    min_score = trial.suggest_int("min_score", 60, 80)
-    min_rr    = trial.suggest_float("min_rr", 1.5, 3.5, step=0.1)
+    # Suggest parameters — Priority 4: expanded ranges for v8.1
+    # v8.1 is stricter (H4 quality + bar-close), so lower min_score needed for enough trades.
+    # Wider min_rr lets optimizer find the sweet spot per asset.
+    min_score = trial.suggest_int("min_score", 40, 85)
+    min_rr    = trial.suggest_float("min_rr", 1.0, 4.0, step=0.1)
     
     # Run backtest
     # NOTE: use_ai=False here for speed — AI scores (Kronos/Vibe) cannot be

@@ -13,6 +13,7 @@ class MT5Executor:
         self.magic = 20260101
         self.vault_path = os.path.join(os.path.dirname(__file__), "opentrades.json")
         self._ensure_vault()
+        self._pending_orders: list[dict] = []  # Priority 3: pending limit order tracker
 
     def _ensure_vault(self):
         if not os.path.exists(self.vault_path):
@@ -62,25 +63,40 @@ class MT5Executor:
         return True
 
     def open_trade(self, symbol, action, entry, sl, tp, risk_usd, journal, score=None, setup_score=None):
-        lots = calculate_lots(entry, sl, risk_usd, symbol)
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             log.error(f"No tick data for {symbol}")
             return
+
+        order_type      = mt5.ORDER_TYPE_BUY  if action == "buy"  else mt5.ORDER_TYPE_SELL
+        execution_price = tick.ask            if action == "buy"  else tick.bid
+        filling         = self._get_filling(symbol)
 
         # ── Spread Shield (Guard 1) ──────────────────────────────────
         if not self._is_spread_ok(symbol):
             log.warning(f"  → Rejected: {symbol} spread is too wide (News/Rollover?)")
             return
 
-        order_type = mt5.ORDER_TYPE_BUY  if action == "buy"  else mt5.ORDER_TYPE_SELL
-        price      = tick.ask            if action == "buy"  else tick.bid
-        filling    = self._get_filling(symbol)
+        # ── Execution Price Drift Guard (Priority 1) ─────────────────────
+        # After bar-close confirmation, live price may have drifted from zone.entry.
+        # If drift > 1 ATR, the planned SL distance is wrong → lot size is wrong.
+        price_drift = abs(execution_price - entry)
+        atr = self._get_current_atr(symbol)
+        if atr > 0 and price_drift > atr * 1.0:
+            log.warning(
+                f"  → Execution drift: price moved {price_drift:.5f} from zone entry "
+                f"(1 ATR = {atr:.5f}). Lot size recalculated from live price, "
+                f"but actual risk may differ. Consider pending orders instead."
+            )
+
+        # Use live execution price (not zone entry) so lot size reflects
+        # the actual risk distance from fill price to SL.
+        lots = calculate_lots(execution_price, sl, risk_usd, symbol)
 
         # ── Margin Pre-Check (Guard 2) ────────────────────────────────
         # Prevents 10019 "No money" broker rejections by checking locally first.
         account    = mt5.account_info()
-        margin_req = mt5.order_calc_margin(order_type, symbol, lots, price)
+        margin_req = mt5.order_calc_margin(order_type, symbol, lots, execution_price)
         if account is None or margin_req is None:
             log.error(f"Cannot get account/margin info for {symbol} — skipping")
             return
@@ -100,7 +116,7 @@ class MT5Executor:
             "symbol":       symbol,
             "volume":       lots,
             "type":         order_type,
-            "price":        price,
+            "price":        execution_price,
             "sl":           sl,
             "tp":           tp,
             "deviation":    20,
@@ -113,7 +129,7 @@ class MT5Executor:
         result = mt5.order_send(request)
 
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            executed_price = result.price if result.price else price
+            executed_price = result.price if result.price else execution_price
             log.info(f"TRADE OPENED | {symbol} {action} | Ticket #{result.order} | Price {executed_price}")
             
             journal.open_trade(symbol, action, executed_price, sl, tp, lots, risk_usd, result.order, score=score, setup_score=setup_score)
@@ -134,6 +150,147 @@ class MT5Executor:
             err = result.comment if result else str(mt5.last_error())
             log.error(f"FAILED | {symbol} {action} | {err} (retcode: {result.retcode if result else 'N/A'})")
             journal.fail_trade(symbol, action, entry, sl, tp, lots, risk_usd, err)
+
+    def place_limit_order(self, symbol, action, entry_price, sl, tp, risk_usd, journal,
+                          score=None, setup_score=None, max_bars: int = 6):
+        """
+        Priority 3: Place a pending limit order at zone.entry instead of market order.
+        After bar-close confirmation, price has moved away from zone.entry.
+        A limit order ensures we get the planned entry on retrace.
+        If not filled within max_bars (default 6 × M5 = 30 min), it's cancelled.
+        """
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            log.error(f"No tick data for {symbol}")
+            return
+
+        filling = self._get_filling(symbol)
+        lots = calculate_lots(entry_price, sl, risk_usd, symbol)
+
+        account    = mt5.account_info()
+        order_type = mt5.ORDER_TYPE_BUY_LIMIT if action == "buy" else mt5.ORDER_TYPE_SELL_LIMIT
+        margin_req = mt5.order_calc_margin(
+            mt5.ORDER_TYPE_BUY if action == "buy" else mt5.ORDER_TYPE_SELL,
+            symbol, lots, entry_price
+        )
+        if account is None or margin_req is None:
+            log.error(f"Cannot get account/margin info for {symbol} — skipping")
+            return
+        if margin_req > account.margin_free * 0.90:
+            log.warning(
+                f"  → Rejected limit: insufficient margin | {symbol} | "
+                f"Need ${margin_req:.2f} but only ${account.margin_free:.2f} free"
+            )
+            return
+
+        # Calculate expiration time (max_bars × 5 minutes)
+        expiration = int((datetime.now(timezone.utc) + timedelta(minutes=max_bars * 5)).timestamp())
+
+        request = {
+            "action":       mt5.TRADE_ACTION_PENDING,
+            "symbol":       symbol,
+            "volume":       lots,
+            "type":         order_type,
+            "price":        round(entry_price, mt5.symbol_info(symbol).digits),
+            "sl":           sl,
+            "tp":           tp,
+            "deviation":    20,
+            "magic":        self.magic,
+            "comment":      "TTFM LIMIT",
+            "type_time":    mt5.ORDER_TIME_SPECIFIED,
+            "type_filling": filling,
+            "expiration":   expiration,
+        }
+
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            log.info(
+                f"LIMIT ORDER PLACED | {symbol} {action} | Ticket #{result.order} | "
+                f"Price {entry_price:.5f} | Expires in {max_bars * 5}min"
+            )
+            self._pending_orders.append({
+                "ticket":     result.order,
+                "symbol":     symbol,
+                "action":     action,
+                "entry":      entry_price,
+                "sl":         sl,
+                "tp":         tp,
+                "lots":       lots,
+                "risk_usd":   risk_usd,
+                "score":      score,
+                "setup_score": setup_score,
+                "placed_at":  datetime.now(timezone.utc),
+                "max_bars":   max_bars,
+                "journal":    journal,
+            })
+        else:
+            err = result.comment if result else str(mt5.last_error())
+            log.error(f"LIMIT FAILED | {symbol} {action} | {err} (retcode: {result.retcode if result else 'N/A'})")
+
+    def check_pending_orders(self, journal, current_bar_time=None):
+        """
+        Priority 3: Check if pending limit orders have been filled or expired.
+        Called every loop iteration from engine.py.
+        """
+        if not self._pending_orders:
+            return
+
+        now = datetime.now(timezone.utc)
+        still_pending = []
+
+        for pending in self._pending_orders:
+            ticket = pending["ticket"]
+            symbol = pending["symbol"]
+
+            # Check if order was filled (became a position)
+            positions = mt5.positions_get(ticket=ticket)
+            if positions:
+                pos = positions[0]
+                executed_price = pos.price_open
+                log.info(f"LIMIT FILLED | {symbol} #{ticket} @ {executed_price:.5f}")
+                journal.open_trade(
+                    symbol, pending["action"], executed_price,
+                    pending["sl"], pending["tp"], pos.volume,
+                    pending["risk_usd"], ticket,
+                    score=pending.get("score"), setup_score=pending.get("setup_score")
+                )
+                self._add_local_trade({
+                    "mt5Ticket":     ticket,
+                    "ticker":        symbol,
+                    "action":        pending["action"],
+                    "entry":         executed_price,
+                    "sl":            pending["sl"],
+                    "tp":            pending["tp"],
+                    "lots":          pos.volume,
+                    "openedAt":      now.isoformat(),
+                    "breakevenSet":  False,
+                    "partialClosed": False
+                })
+                continue  # Remove from pending list
+
+            # Check if order still exists (not yet filled or cancelled)
+            orders = mt5.orders_get(ticket=ticket)
+            if not orders:
+                # Order is gone — either filled (handled above) or cancelled/expired
+                log.info(f"LIMIT ORDER REMOVED | {symbol} #{ticket} (expired or cancelled)")
+                continue
+
+            # Check expiration
+            placed_at = pending["placed_at"]
+            max_minutes = pending["max_bars"] * 5
+            if (now - placed_at).total_seconds() / 60 > max_minutes:
+                log.info(f"LIMIT EXPIRED | {symbol} #{ticket} ({max_minutes}min without fill)")
+                # Cancel the order
+                cancel_req = {
+                    "action": mt5.TRADE_ACTION_REMOVE,
+                    "order":  ticket,
+                }
+                mt5.order_send(cancel_req)
+                continue  # Remove from pending list
+
+            still_pending.append(pending)
+
+        self._pending_orders = still_pending
 
     def _is_spread_ok(self, symbol: str) -> bool:
         info = mt5.symbol_info(symbol)
@@ -186,8 +343,9 @@ class MT5Executor:
                 self._close_position(ticket, "timeout", journal)
                 continue
 
+            risk = abs(entry - sl)
             tp_distance = abs(tp - entry)
-            if not trade.get("breakevenSet") and price_move_in_favour >= (tp_distance * 0.5):
+            if not trade.get("breakevenSet") and risk > 0 and price_move_in_favour >= (risk * 1.0):
                 partial_lots = round(pos.volume * 0.50, 2)
                 partial_lots = max(mt5.symbol_info(pos.symbol).volume_min, partial_lots)
                 if partial_lots < pos.volume:
@@ -206,13 +364,13 @@ class MT5Executor:
                     journal.set_breakeven(ticket)
                     self._update_local_trade(ticket, {"breakevenSet": True})
 
-            if not trade.get("partialClosed") and price_move_in_favour >= (tp_distance * 0.75):
+            if not trade.get("partialClosed") and risk > 0 and price_move_in_favour >= (risk * 2.0):
                 partial_lots = round(pos.volume * 0.30, 2)
                 partial_lots = max(mt5.symbol_info(pos.symbol).volume_min, min(partial_lots, pos.volume - mt5.symbol_info(pos.symbol).volume_min))
                 if partial_lots > 0:
                     self._partial_close(ticket, pos, partial_lots, "TP2_75p_target", journal)
 
-            if trade.get("breakevenSet") and price_move_in_favour >= (tp_distance * 0.85):
+            if trade.get("breakevenSet") and risk > 0 and price_move_in_favour >= (risk * 2.0):
                 atr = self._get_current_atr(pos.symbol)
                 if atr > 0:
                     new_sl = (current - atr * 0.5) if is_buy else (current + atr * 0.5)

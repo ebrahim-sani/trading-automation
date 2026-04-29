@@ -1,16 +1,20 @@
 """
-TTFM Backtesting Engine v2.1
+TTFM Backtesting Engine v8.2
 ─────────────────────────────────────────────────────────────────────────────
-Mirrors the live engine.py [v8.1] CMP strategy with surgical execution fixes:
+Mirrors the live engine.py [v8.2] CMP strategy with execution fixes:
 
-  Fix A — H4 Displacement Filter   (body ≥ 40% of range — was 60%)
-  Fix B — H4 Zone Freshness        (last 30 H4 candles = ~5 days — was 12)
-  Fix C — Momentum Extreme Breaker (skip entry if 6 consecutive M5 bars
-                                    all one direction AND move > 2×ATR14)
+  Fix A — H4 Displacement Filter   (body ≥ 40% of range)
+  Fix B — H4 Zone Freshness        (last 30 H4 candles = ~5 days)
+  Fix C — Momentum Extreme Breaker (skip if 6 bars one-way + > 2×ATR14)
   Fix D — Bar-Close Confirmation   (entry on sweep + close confirmation)
+  Fix E — Per-Asset Rate Limit     (live only, not applied in backtest)
 
-  Note: Fix E (per-asset rate limit) is live-trading only; it is not
-  applied in backtest so we can measure raw strategy signal quality.
+  Priority 1 — Execution Price Drift Guard (live only)
+  Priority 2 — ATR-Based SL Buffer (wick ± 0.25× ATR14)
+  Priority 3 — Reverted: limit order entry caused missed trends
+  Priority 4 — Expanded Optimizer Ranges (optimizer.py only)
+  Priority 5 — Momentum as Risk Reducer (3+ bars → 0.5× risk, 6+ bars → block)
+  Priority 6 — TP1 at 1R / TP2 at 2R (R-based partial closes, ATR trail)
 """
 
 from __future__ import annotations
@@ -235,11 +239,13 @@ class BacktestEngine:
     """
 
     # ── Strategy constants (mirrors engine.py v8.1) ──────────────────────
-    MIN_BODY_RATIO    = 0.20   # M5 zone-forming candle min body ratio
-    H4_MIN_BODY_RATIO = 0.40   # Fix A: H4 candle must have ≥40% body-to-range
-    H4_ZONE_LOOKBACK  = 30     # Fix B: last 30 H4 candles (~5 days)
-    MOMENTUM_BARS     = 6      # Fix C: consecutive M5 bars for extreme check
-    MOMENTUM_ATR_MULT = 2.0    # Fix C: move must exceed this × ATR14 to block
+    MIN_BODY_RATIO      = 0.20   # M5 zone-forming candle min body ratio
+    H4_MIN_BODY_RATIO   = 0.40   # Fix A: H4 candle must have ≥40% body-to-range
+    H4_ZONE_LOOKBACK    = 30     # Fix B: last 30 H4 candles (~5 days)
+    MOMENTUM_BARS       = 6      # Fix C: consecutive M5 bars for extreme check
+    MOMENTUM_ATR_MULT   = 2.0    # Fix C: move must exceed this × ATR14 to block
+    ATR_SL_BUFFER_MULT  = 0.25   # Priority 2: extra ATR buffer beyond wick for SL
+    MOMENTUM_RISK_MULT  = 0.50   # Priority 5: risk multiplier when momentum elevated
 
     def __init__(
         self,
@@ -320,7 +326,7 @@ class BacktestEngine:
             
             # ── 1. Manage existing trade ─────────────────────────────
             if open_trade is not None:
-                open_trade, closed = self._advance_trade(open_trade, i, highs, lows, times)
+                open_trade, closed = self._advance_trade(open_trade, i, highs, lows, times, closes)
                 if closed:
                     trades.append(closed)
                     open_trade = None
@@ -354,17 +360,29 @@ class BacktestEngine:
             body         = abs(last_c - last_o)
             body_ratio   = body / candle_range if candle_range > 0 else 0
 
+            # ATR14 minimum SL distance — mirrors live engine filter
+            atr_start_b = max(0, i - 20)
+            if (i - atr_start_b) >= 15:
+                ah_b = highs[atr_start_b:i - 2]
+                al_b = lows[atr_start_b:i - 2]
+                ac_b = closes[atr_start_b:i - 2]
+                tr_b = [max(ah_b[j]-al_b[j], abs(ah_b[j]-ac_b[j-1]), abs(al_b[j]-ac_b[j-1])) for j in range(1, len(ah_b))]
+                atr14_b = sum(tr_b[-14:]) / 14 if len(tr_b) >= 14 else 0.0
+            else:
+                atr14_b = 0.0
+            min_sl_b = atr14_b * 0.4
+
             if body_ratio < self.MIN_BODY_RATIO:
                 pass  # Doji — skip zone creation
             elif is_bullish and valid_bullish_htf:
-                e = last_o   # M5 open = entry trigger
-                s = last_l   # M5 candle low = tight SL
-                if (e - s) > 0:
+                e = last_o
+                s = last_l - atr14_b * self.ATR_SL_BUFFER_MULT  # ATR buffer below wick
+                if (e - s) > 0 and (min_sl_b == 0 or (e - s) >= min_sl_b):
                     active_zones.append(OHLCZone(e, s, e + (e - s) * self.min_rr, True,  100, {}, i - 1))
             elif is_bearish and valid_bearish_htf:
-                e = last_o   # M5 open = entry trigger
-                s = last_h   # M5 candle high = tight SL
-                if (s - e) > 0:
+                e = last_o
+                s = last_h + atr14_b * self.ATR_SL_BUFFER_MULT  # ATR buffer above wick
+                if (s - e) > 0 and (min_sl_b == 0 or (s - e) >= min_sl_b):
                     active_zones.append(OHLCZone(e, s, e - (s - e) * self.min_rr, False, 100, {}, i - 1))
 
             if len(active_zones) > MAX_ZONES:
@@ -391,8 +409,9 @@ class BacktestEngine:
                     bear_confirmed = not z.is_bullish and highs[i] >= z.entry and closes[i] < z.entry
                     if bull_confirmed or bear_confirmed:
                         direction = "buy" if z.is_bullish else "sell"
-                        # Fix C: Momentum extreme breaker
-                        if self._is_momentum_extreme(highs, lows, closes, opens, i, direction):
+                        # Fix C + Priority 5: Momentum check — block extreme, allow elevated
+                        momentum_mult = self._is_momentum_extreme(highs, lows, closes, opens, i, direction)
+                        if momentum_mult == 0.0:
                             continue
                         open_trade = Trade(
                             symbol=self.symbol,
@@ -432,7 +451,7 @@ class BacktestEngine:
 
     def _advance_trade(
         self, trade: Trade, current_bar: int,
-        highs: np.ndarray, lows: np.ndarray, times
+        highs: np.ndarray, lows: np.ndarray, times, closes: np.ndarray = None
     ) -> tuple[Optional[Trade], Optional[Trade]]:
         """
         Check if the trade's SL or TP was hit at current_bar.
@@ -442,49 +461,58 @@ class BacktestEngine:
         l = lows[current_bar]
         t = times[current_bar]
 
-        risk = abs(trade.entry - trade.sl) if not trade.sl_moved_to_be else abs(trade.entry - (trade.entry - trade.entry * 0.001)) # safeguard risk div
+        orig_risk = abs(trade.entry - trade.sl)  # original risk, never changes
+        risk = orig_risk if not trade.sl_moved_to_be else abs(trade.entry - (trade.entry - trade.entry * 0.001))
         tp_dist = abs(trade.tp - trade.entry)
 
         # Helper to process hits
         def process_targets(high_price, low_price):
             if trade.direction == "buy":
-                # TP1 (50%)
-                if not trade.tp1_hit and risk > 0 and high_price >= trade.entry + (tp_dist * 0.5):
+                # TP1 (1R)
+                if not trade.tp1_hit and orig_risk > 0 and high_price >= trade.entry + (orig_risk * 1.0):
                     trade.tp1_hit = True
                     trade.sl = trade.entry
                     trade.sl_moved_to_be = True
                     close_weight = 0.5
-                    trade.pnl_r += close_weight * (trade.rr * 0.5)
+                    trade.pnl_r += close_weight * 1.0
                     trade.current_weight -= close_weight
-                # TP2 (75%)
-                if not trade.tp2_hit and risk > 0 and high_price >= trade.entry + (tp_dist * 0.75):
+                # TP2 (2R)
+                if not trade.tp2_hit and orig_risk > 0 and high_price >= trade.entry + (orig_risk * 2.0):
                     trade.tp2_hit = True
                     close_weight = 0.3
-                    trade.pnl_r += close_weight * (trade.rr * 0.75)
+                    trade.pnl_r += close_weight * 2.0
                     trade.current_weight -= close_weight
-                # Trailing SL (85%)
-                if not trade.trail_sl_active and risk > 0 and high_price >= trade.entry + (tp_dist * 0.85):
+                # Trailing SL (activates at 2R, same as TP2)
+                if not trade.trail_sl_active and orig_risk > 0 and high_price >= trade.entry + (orig_risk * 2.0):
                     trade.trail_sl_active = True
-                    trade.sl = trade.entry + (tp_dist * 0.5)  # lock in 50% profit for remainder
+                    atr = _get_atr(highs[max(0, current_bar-19):current_bar+1],
+                                   lows[max(0, current_bar-19):current_bar+1],
+                                   closes[max(0, current_bar-19):current_bar+1], 14)
+                    if atr > 0:
+                        trade.sl = high_price - atr * 0.5
             else:
-                # TP1 (50%)
-                if not trade.tp1_hit and risk > 0 and low_price <= trade.entry - (tp_dist * 0.5):
+                # TP1 (1R)
+                if not trade.tp1_hit and orig_risk > 0 and low_price <= trade.entry - (orig_risk * 1.0):
                     trade.tp1_hit = True
                     trade.sl = trade.entry
                     trade.sl_moved_to_be = True
                     close_weight = 0.5
-                    trade.pnl_r += close_weight * (trade.rr * 0.5)
+                    trade.pnl_r += close_weight * 1.0
                     trade.current_weight -= close_weight
-                # TP2 (75%)
-                if not trade.tp2_hit and risk > 0 and low_price <= trade.entry - (tp_dist * 0.75):
+                # TP2 (2R)
+                if not trade.tp2_hit and orig_risk > 0 and low_price <= trade.entry - (orig_risk * 2.0):
                     trade.tp2_hit = True
                     close_weight = 0.3
-                    trade.pnl_r += close_weight * (trade.rr * 0.75)
+                    trade.pnl_r += close_weight * 2.0
                     trade.current_weight -= close_weight
-                # Trailing SL (85%)
-                if not trade.trail_sl_active and risk > 0 and low_price <= trade.entry - (tp_dist * 0.85):
+                # Trailing SL (activates at 2R, same as TP2)
+                if not trade.trail_sl_active and orig_risk > 0 and low_price <= trade.entry - (orig_risk * 2.0):
                     trade.trail_sl_active = True
-                    trade.sl = trade.entry - (tp_dist * 0.5)
+                    atr = _get_atr(highs[max(0, current_bar-19):current_bar+1],
+                                   lows[max(0, current_bar-19):current_bar+1],
+                                   closes[max(0, current_bar-19):current_bar+1], 14)
+                    if atr > 0:
+                        trade.sl = low_price + atr * 0.5
 
         # Process partial targets first
         process_targets(h, l)
@@ -559,17 +587,20 @@ class BacktestEngine:
         self,
         highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, opens: np.ndarray,
         bar_idx: int, direction: str
-    ) -> bool:
+    ) -> float:
         """
-        Fix C: Returns True if the last MOMENTUM_BARS closed bars before bar_idx
-        are ALL one-directional AND total range > MOMENTUM_ATR_MULT × ATR14.
+        Fix C + Priority 5: Returns a risk multiplier based on momentum conditions.
+        Returns:
+            0.0 → extreme momentum (all bars one-directional + move > 2×ATR14), BLOCK trade
+            0.5 → elevated momentum (3+ bars one-directional), REDUCE risk
+            1.0 → normal conditions, FULL risk
 
         direction='buy'  → checks for bearish crash (we'd be buying into it)
         direction='sell' → checks for bullish spike (we'd be selling into it)
         """
         needed = bar_idx - (self.MOMENTUM_BARS + 2)
         if needed < 20:
-            return False
+            return 1.0
 
         start = bar_idx - self.MOMENTUM_BARS - 2
         end   = bar_idx - 2
@@ -582,9 +613,6 @@ class BacktestEngine:
         else:
             all_directional = all(seg_c[j] > seg_o[j] for j in range(len(seg_c)))
 
-        if not all_directional:
-            return False
-
         atr_start = bar_idx - 20
         atr_h = highs[atr_start:bar_idx - 2]
         atr_l = lows[atr_start:bar_idx - 2]
@@ -594,13 +622,31 @@ class BacktestEngine:
             for j in range(1, len(atr_h))
         ]
         if len(tr_list) < 14:
-            return False
+            return 1.0
         atr14 = sum(tr_list[-14:]) / 14
 
         seg_h = highs[start:end]
         seg_l = lows[start:end]
         total_move = float(seg_h.max() - seg_l.min())
-        return total_move > (self.MOMENTUM_ATR_MULT * atr14)
+
+        # Extreme: all bars one-directional AND move > 2×ATR → block
+        if all_directional and total_move > (self.MOMENTUM_ATR_MULT * atr14):
+            return 0.0
+
+        # Elevated: 3+ consecutive bars one-directional (but not extreme) → halve risk
+        half_bars = self.MOMENTUM_BARS // 2
+        half_start = bar_idx - half_bars - 2
+        if half_start >= 1:
+            half_c = closes[half_start:bar_idx - 2]
+            half_o = opens[half_start:bar_idx - 2]
+            if direction == "buy":
+                half_directional = all(half_c[j] < half_o[j] for j in range(len(half_c)))
+            else:
+                half_directional = all(half_c[j] > half_o[j] for j in range(len(half_c)))
+            if half_directional:
+                return 0.5
+
+        return 1.0
 
     def _get_active_htf_zones(self, df_htf: pd.DataFrame) -> List[dict]:
         """
