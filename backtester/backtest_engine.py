@@ -80,6 +80,7 @@ class BacktestResult:
     trades:      list[Trade]        = field(default_factory=list)
     total:       int                = 0
     wins:        int                = 0
+    half_wins:   int                = 0
     losses:      int                = 0
     timeouts:    int                = 0
     win_rate:    float              = 0.0
@@ -703,16 +704,16 @@ class BacktestEngine:
             return
 
         result.total    = len(trades)
-        result.wins     = sum(1 for t in trades if t.outcome == "WIN")
+        result.wins     = sum(1 for t in trades if t.outcome in ("WIN", "HALF-WIN"))
+        result.half_wins= sum(1 for t in trades if t.outcome == "HALF-WIN")
         result.losses   = sum(1 for t in trades if t.outcome == "LOSS")
         result.timeouts = sum(1 for t in trades if t.outcome == "TIMEOUT")
         be_trades       = sum(1 for t in trades if t.outcome == "BREAKEVEN")
         
-        # Win rate excludes Breakeven trades (as they are scratches)
         decisive_trades = result.wins + result.losses
         result.win_rate = result.wins / decisive_trades if decisive_trades > 0 else 0.0
 
-        win_rr   = [t.pnl_r for t in trades if t.outcome == "WIN"]
+        win_rr   = [t.pnl_r for t in trades if t.outcome in ("WIN", "HALF-WIN")]
         loss_rr  = [t.pnl_r for t in trades if t.outcome == "LOSS"]
         result.avg_rr_win  = float(np.mean(win_rr))  if win_rr  else 0.0
         result.avg_rr_loss = float(np.mean(loss_rr)) if loss_rr else 0.0

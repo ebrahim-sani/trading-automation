@@ -57,7 +57,6 @@ if __name__ == "__main__":
         session_start_hour    = 7.5,      # 07:30 Broker Time (Starts exactly at 08:30 Nigerian Time)
         session_end_hour      = 22.0,     # 22:00 Broker Time (NY Close)
 
-        max_daily_loss_usd    = 15.0,    # 3× risk — halt for the day
         max_weekly_loss_usd   = 40.0,    # 8× risk — halt for the week
         max_consecutive_loss  = 2,       # Cool down after 2 straight losses
         cooldown_hours        = 2,       # Cool down for 2 hours

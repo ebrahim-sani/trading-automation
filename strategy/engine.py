@@ -58,7 +58,7 @@ MAX_CLUSTER_TRADES = 1
 
 class StrategyEngine:
     """
-    TTFM Alpha Combiner [v8.2] — CMP with Surgical Execution Fixes + R-Based Management
+    TTFM Alpha Combiner [v8.3] — H4 Direction Filter + Latency Guard + No Daily Limit
     ─────────────────────────────────────────────────────────────────────────
     Root-cause analysis of the 7-consecutive-loss streak identified that
     only two EXECUTION issues were at fault:
@@ -110,6 +110,24 @@ class StrategyEngine:
         TP2 triggers at 2× risk distance (was 75% of TP), closes 30%.
         Trailing SL activates at 2R with ATR-based trail.
         Mathematically classifies more winners and improves win rate.
+
+    v8.3 adds:
+
+      Fix G — H4 Current-Direction Filter:
+        Blocks entries when the last 2 consecutive H4 bars BOTH strongly oppose
+        the trade direction (body ≥ 50% of range). One bearish H4 bar = normal
+        pullback into zone (allowed). Two in a row = active crash/spike regime
+        (blocked). Catches what the momentum breaker misses on higher timeframes.
+
+      Fix H — Bar-Close Latency Guard:
+        After bar-close detection, if the elapsed time since that bar's close
+        exceeds 60 seconds the entry is skipped (zone memory still updated).
+        Prevents stale fills on slow servers where the scan loop runs late.
+
+      Fix I — Daily Loss Limit Removed:
+        The engine now trades any number of valid setups per day regardless of
+        intraday drawdown. The weekly circuit breaker is retained as the only
+        capital-level protection gate.
     """
 
     # ── Strategy constants ───────────────────────────────────────────────
@@ -204,7 +222,7 @@ class StrategyEngine:
                 log.error(f"Failed to load optimized params: {e}")
 
     def run(self):
-        log.info("TTFM Alpha Combiner [v8.1] started")
+        log.info("TTFM Alpha Combiner [v8.3] started")
         if not self.executor.init():
             return
 
@@ -218,7 +236,7 @@ class StrategyEngine:
         session_status = "✅ ACTIVE" if in_session else "⏳ WAITING FOR SESSION"
 
         startup_msg = (
-            f"🚀 *TTFM ALPHA COMBINER V8.1 INITIALIZED*\n"
+            f"🚀 *TTFM ALPHA COMBINER V8.3 INITIALIZED*\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"🟢 *Status:* {session_status}\n"
             f"🌍 *Session:* `{start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC`\n"
@@ -271,13 +289,6 @@ class StrategyEngine:
                 elif self._cooldown_until:
                     log.info("Cooldown period ended. Resuming trading.")
                     self._cooldown_until = None
-
-                # ── Guard: Daily loss limit ──────────────────────────────
-                today_pnl = self.journal.get_today_pnl()
-                if today_pnl <= -self.max_daily_loss_usd:
-                    log.warning(f"DAILY LIMIT HIT: PnL={today_pnl:.2f}. Pausing.")
-                    time.sleep(300)
-                    continue
 
                 # ── Guard: Weekly loss limit ─────────────────────────────
                 if self._is_weekly_limit_hit():
@@ -390,6 +401,41 @@ class StrategyEngine:
 
         return 1.0
 
+    def _is_h4_aligned(self, df_h4: pd.DataFrame, direction: str, symbol: str) -> bool:
+        """
+        Fix G: Rejects entries when the last 2 completed H4 bars both strongly oppose
+        the trade direction (body ≥ 50% of range). A single opposing H4 bar is a normal
+        pullback into a zone and is allowed. Two in a row signals an active momentum
+        regime (crash / spike) where CMP retests consistently fail.
+        """
+        if len(df_h4) < 4:
+            return True
+
+        opposing = 0
+        for bar in [df_h4.iloc[-3], df_h4.iloc[-2]]:
+            o = float(bar["open"])
+            h = float(bar["high"])
+            l = float(bar["low"])
+            c = float(bar["close"])
+            rng = h - l
+            if rng <= 0:
+                continue
+            body_ratio = abs(c - o) / rng
+            if body_ratio < 0.50:
+                continue
+            if direction == "buy"  and c < o:
+                opposing += 1
+            elif direction == "sell" and c > o:
+                opposing += 1
+
+        if opposing >= 2:
+            log.info(
+                f"[{symbol}] H4 direction block: 2 consecutive strong H4 bars opposing "
+                f"{direction.upper()} — skipping entry"
+            )
+            return False
+        return True
+
     # ─────────────────────────────────────────────────────────────────────
     #  D1 TREND GATE (kept for reference, no longer called by _process_symbol)
     # ─────────────────────────────────────────────────────────────────────
@@ -448,6 +494,16 @@ class StrategyEngine:
 
         self.last_bar_time[symbol] = closed_bar_time
 
+        # Fix H: Bar-close latency guard — M5 bar close = open_time + 300s
+        bar_close_ts      = closed_bar_time + 300
+        detection_lag_s   = datetime.now(timezone.utc).timestamp() - bar_close_ts
+        bar_entry_allowed = detection_lag_s <= 60
+        if not bar_entry_allowed:
+            log.debug(
+                f"[{symbol}] Late bar detection ({detection_lag_s:.1f}s after close) "
+                f"— zones updated but no entry"
+            )
+
         if len(df_m5) < 5 or len(df_h4) < 15:
             return
 
@@ -485,9 +541,14 @@ class StrategyEngine:
 
             # Entry confirmation: sweep + close on correct side
             if zone["is_bullish"] and bar_l <= zone["entry"] and bar_c > zone["entry"]:
+                if not bar_entry_allowed:
+                    log.debug(f"[{symbol}] Stale bar ({detection_lag_s:.1f}s) — skipping bull entry @ {zone['entry']:.5f}")
+                    continue
                 momentum_mult = self._is_momentum_extreme(df_m5, "buy")
                 if momentum_mult == 0.0:
                     log.info(f"[{symbol}] Momentum extreme — skipping bull entry")
+                    continue
+                if not self._is_h4_aligned(df_h4, "buy", symbol):
                     continue
                 risk = zone["entry"] - zone["sl"]
                 rr   = round((zone["tp"] - zone["entry"]) / risk, 1) if risk > 0 else 0
@@ -503,9 +564,14 @@ class StrategyEngine:
                 zone["active"] = False
 
             elif not zone["is_bullish"] and bar_h >= zone["entry"] and bar_c < zone["entry"]:
+                if not bar_entry_allowed:
+                    log.debug(f"[{symbol}] Stale bar ({detection_lag_s:.1f}s) — skipping bear entry @ {zone['entry']:.5f}")
+                    continue
                 momentum_mult = self._is_momentum_extreme(df_m5, "sell")
                 if momentum_mult == 0.0:
                     log.info(f"[{symbol}] Momentum extreme — skipping bear entry")
+                    continue
+                if not self._is_h4_aligned(df_h4, "sell", symbol):
                     continue
                 risk = zone["sl"] - zone["entry"]
                 rr   = round((zone["entry"] - zone["tp"]) / risk, 1) if risk > 0 else 0
@@ -774,8 +840,7 @@ class StrategyEngine:
             f"📊 *DAILY BRIEFING*\n"
             f"├─ 🕒 Window: `{start_h:02d}:{start_m:02d} – {end_h:02d}:{end_m:02d} UTC`\n"
             f"├─ 💎 Assets: `{len(self.symbols)} active hunters`\n"
-            f"├─ 🛡️ Risk Cap: `${self.max_daily_loss_usd:.2f} max loss`\n"
-            f"└─ 🔒 Filters: `H4 Quality (40%) + Bar-Close + Momentum Breaker + 3h Cooldown`\n"
+            f"└─ 🔒 Filters: `H4 Quality + H4 Direction + Bar-Close + Momentum Breaker + 3h Cooldown`\n"
             f"━━━━━━━━━━━━━━━\n"
             f"🚀 _Algorithms locked. Let's conquer the markets._"
         )

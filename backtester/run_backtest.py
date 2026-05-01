@@ -125,7 +125,7 @@ def backtest_symbol(
     # ── Console summary ──────────────────────────────────────────────────
     log.info(f"\n  ┌─ {symbol} Results ─────────────────────────────────")
     log.info(f"  │  Total Trades : {result.total}")
-    log.info(f"  │  Win / Loss   : {result.wins}W / {result.losses}L / {result.timeouts}TO")
+    log.info(f"  │  Win / Loss   : {result.wins}W ({result.half_wins}HW) / {result.losses}L / {result.timeouts}TO")
     log.info(f"  │  Win Rate     : {result.win_rate*100:.1f}%")
     log.info(f"  │  Expectancy   : {result.expectancy:+.3f}R")
     log.info(f"  │  Total PnL    : {result.total_pnl_r:+.2f}R  (${result.total_pnl_usd:+.2f})")
