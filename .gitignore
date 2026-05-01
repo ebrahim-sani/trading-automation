@@ -3,8 +3,6 @@
 
 # Sensitive / runtime state
 strategy/opentrades.json
-**/.env
-**/.env.*
 !**/.env.example
 
 # Backtest output
@@ -59,7 +57,7 @@ Kronos/results/
 # ── OS & IDE ──────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-.vscode/
 .idea/
 *.swp
 *.swo
+config.bat
